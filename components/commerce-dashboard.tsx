@@ -750,7 +750,7 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     return (
       <div className="grid gap-5 2xl:grid-cols-[320px_1fr]">
         <section className="rounded-[25px] border border-[#dbe8e2] bg-white p-4 shadow-sm">
-          <div className="px-1 pb-3"><p className="text-sm font-black text-[#193f36]">ร้านค้าในระบบ</p><p className="mt-1 text-xs text-[#72887e]">รายชื่อจะเพิ่มขึ้นเมื่อมีผู้ค้าปลีกลงทะเบียน</p></div>
+          <div className="px-1 pb-3"><p className="text-sm font-black text-[#193f36]">ร้านค้าในระบบ</p><p className="mt-1 text-xs text-[#72887e]">รายชื่อร้านค้าที่มีในระบบ</p></div>
           <div className="max-h-[610px] space-y-2 overflow-y-auto pr-1">
             {allRetailers.map((retailer) => {
               const currentCount = orders.filter((order) => order.retailer_id === retailer.id && order.status !== "COMPLETED").length;
