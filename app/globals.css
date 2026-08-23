@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+:root {
+  --ink: #11221f;
+  --pine: #0e4d43;
+  --mint: #dcefe7;
+  --cream: #fbfaf5;
+  --coral: #f27d52;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--cream);
+  color: var(--ink);
+  font-family: "Noto Sans Thai", "Leelawadee UI", Tahoma, Arial, sans-serif;
+}
+
+button,
+a,
+input { -webkit-tap-highlight-color: transparent; }
+
+button:not(:disabled),
+a { cursor: pointer; }
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible {
+  outline: 3px solid rgba(29, 139, 113, .3);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: #a8dfca;
+  color: #0b3e36;
+}
+
+.map-surface {
+  background-color: #d9e8df;
+  background-image:
+    linear-gradient(28deg, transparent 46%, rgba(255,255,255,.9) 47%, rgba(255,255,255,.9) 51%, transparent 52%),
+    linear-gradient(112deg, transparent 47%, rgba(255,255,255,.88) 48%, rgba(255,255,255,.88) 52%, transparent 53%),
+    linear-gradient(0deg, rgba(14,77,67,.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(14,77,67,.05) 1px, transparent 1px);
+  background-size: 220px 180px, 250px 210px, 32px 32px, 32px 32px;
+}
+
+.map-route {
+  stroke-dasharray: 8 9;
+  animation: route-flow 1.2s linear infinite;
+}
+
+.pin-pulse { animation: pin-pulse 1.8s ease-out infinite; }
+
+.soft-float { animation: soft-float 4.5s ease-in-out infinite; }
+
+@keyframes route-flow {
+  to { stroke-dashoffset: -34; }
+}
+
+@keyframes pin-pulse {
+  0% { transform: scale(.7); opacity: .8; }
+  75%, 100% { transform: scale(1.8); opacity: 0; }
+}
+
+@keyframes soft-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-8px); }
+}
