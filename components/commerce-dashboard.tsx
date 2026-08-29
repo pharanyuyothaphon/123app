@@ -504,14 +504,32 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
       notify("เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่");
       return;
     }
-    if (status === "COMPLETED" && activeTrackingOrderId === order.id) {
-      stopLiveLocationTracking(false);
-    }
     updateLocalOrderStatus(order.id, status);
     setBusyAction(`order-${order.id}`);
     try {
       await updateDeliveryStatus(session, order.id, status);
-      notify(statusMeta[status].label);
+
+      // The stock change happens in Supabase's transaction. Re-fetch the snapshot
+      // rather than calculating a local decrement, so the dashboard always shows
+      // the database's current value even when more than one employee is working.
+      try {
+        if (role) await refreshLiveData(session, role);
+        notify(
+          status === "DELIVERING"
+            ? "เริ่มนำส่งสินค้าและตัดสต็อกจากคลังเรียบร้อยแล้ว"
+            : statusMeta[status].label,
+        );
+      } catch {
+        notify(
+          status === "DELIVERING"
+            ? "เริ่มนำส่งสินค้าและตัดสต็อกแล้ว แต่ยังโหลดจำนวนล่าสุดไม่สำเร็จ"
+            : `${statusMeta[status].label}แล้ว แต่ยังโหลดข้อมูลล่าสุดไม่สำเร็จ`,
+        );
+      }
+
+      if (status === "COMPLETED" && activeTrackingOrderId === order.id) {
+        stopLiveLocationTracking(false);
+      }
     } catch (error) {
       updateLocalOrderStatus(order.id, order.status);
       notify(error instanceof Error ? error.message : "อัปเดตสถานะไม่สำเร็จ");
