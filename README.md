@@ -115,7 +115,12 @@ npm run reset:role-passwords
 
 ระบบไม่มีพิกัดสุ่มแล้ว และพนักงานแชร์ได้เฉพาะออเดอร์ที่ตนได้รับมอบหมายและมีสถานะ `DELIVERING` เท่านั้น
 
-หลังอัปเดตโค้ดนี้ ให้รัน [20260830_delivery_stock_deduction.sql](./supabase/migrations/20260830_delivery_stock_deduction.sql) ใน Supabase SQL Editor หนึ่งครั้ง เพื่ออัปเดต Custom RPC สำหรับการตัดสต็อก (คำสั่งใช้ `create or replace` จึงไม่ลบข้อมูลเดิม) หากยังไม่เคยตั้งค่า Custom Auth มาก่อน ให้รัน [custom-auth-migration.sql](./supabase/custom-auth-migration.sql) ก่อนตามขั้นตอนติดตั้งด้านบน
+หลังอัปเดตโค้ดนี้ ให้รัน migration ใน Supabase SQL Editor ตามลำดับหนึ่งครั้ง:
+
+1. [20260830_delivery_stock_deduction.sql](./supabase/migrations/20260830_delivery_stock_deduction.sql) เพื่ออัปเดต Custom RPC สำหรับการตัดสต็อกเมื่อเริ่มนำส่ง
+2. [20260903_fix_adjust_stock_ambiguity.sql](./supabase/migrations/20260903_fix_adjust_stock_ambiguity.sql) เพื่อแก้ RPC ปรับจำนวนสินค้า
+
+คำสั่งใช้ `create or replace` จึงไม่ลบข้อมูลเดิม หากยังไม่เคยตั้งค่า Custom Auth มาก่อน ให้รัน [custom-auth-migration.sql](./supabase/custom-auth-migration.sql) ก่อนตามขั้นตอนติดตั้งด้านบน
 
 การแชร์ตำแหน่งต้องใช้ HTTPS เมื่อเปิดใช้งานจริง (localhost ใช้ HTTP ได้) และควรเปิดหน้า Dashboard ของพนักงานทิ้งไว้ระหว่างนำส่ง เพราะ browser บนอุปกรณ์มือถืออาจหยุด GPS เมื่อปิดหน้าเว็บหรือปิดแอป
 

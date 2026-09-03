@@ -117,10 +117,12 @@ begin
     raise exception 'ไม่มีสิทธิ์ปรับจำนวนสินค้า';
   end if;
 
-  update public.products
-  set stock = greatest(0, stock + p_delta)
-  where id = p_product_id
-  returning products.stock into stock;
+  -- `stock` is also this function's output column. Qualify product columns so
+  -- PostgreSQL never treats the reference as the output variable.
+  update public.products as product
+  set stock = greatest(0, product.stock + p_delta)
+  where product.id = p_product_id
+  returning product.stock into stock;
 
   if not found then
     raise exception 'ไม่พบสินค้า';
