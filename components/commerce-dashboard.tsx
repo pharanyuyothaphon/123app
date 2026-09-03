@@ -36,6 +36,7 @@ const LOCATION_MIN_SEND_GAP_MS = 5_000;
 const LOCATION_SEND_INTERVAL_MS = 15_000;
 const LOCATION_MIN_DISTANCE_METERS = 25;
 const RETAILER_CART_STORAGE_PREFIX = "123-commerce:retailer-cart:";
+const MAX_QUANTITY = 10_000;
 
 const roleMeta: Record<Role, { label: string; title: string; description: string; glyph: string; accent: string }> = {
   OWNER: {
@@ -456,7 +457,22 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     if (unit === "packs" && product.price_pack === null) return;
     setCart((current) => {
       const present = current[product.id] || { boxes: 0, packs: 0 };
-      const next = { ...present, [unit]: Math.max(0, present[unit] + delta) };
+      const next = { ...present, [unit]: Math.min(MAX_QUANTITY, Math.max(0, present[unit] + delta)) };
+      if (next.boxes === 0 && next.packs === 0) {
+        const { [product.id]: removed, ...rest } = current;
+        void removed;
+        return rest;
+      }
+      return { ...current, [product.id]: next };
+    });
+  };
+
+  const setCartQuantity = (product: Product, unit: "boxes" | "packs", value: number) => {
+    if (unit === "packs" && product.price_pack === null) return;
+    const quantity = Math.min(MAX_QUANTITY, Math.max(0, Math.floor(value)));
+    setCart((current) => {
+      const present = current[product.id] || { boxes: 0, packs: 0 };
+      const next = { ...present, [unit]: quantity };
       if (next.boxes === 0 && next.packs === 0) {
         const { [product.id]: removed, ...rest } = current;
         void removed;
@@ -849,7 +865,7 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
           <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {matchingProducts.map((product) => {
               const amount = cart[product.id] || { boxes: 0, packs: 0 };
-              return <RetailerProductCard key={product.id} product={product} boxes={amount.boxes} packs={amount.packs} onChange={changeCart} />;
+              return <RetailerProductCard key={product.id} product={product} boxes={amount.boxes} packs={amount.packs} onChange={changeCart} onSetQuantity={setCartQuantity} />;
             })}
           </div>
           {!matchingProducts.length && <EmptyState icon="⌕" title="ไม่พบสินค้า" text="ลองค้นหาด้วยชื่อสินค้าอื่น" />}
@@ -925,7 +941,15 @@ function ProductMark({ product, size = "md" }: { product: Product; size?: "sm" |
 }
 
 function InventoryPanel({ title, caption, products, query, onQueryChange, onAdjust, onDelete, busyAction, owner = false }: { title: string; caption: string; products: Product[]; query: string; onQueryChange: (value: string) => void; onAdjust: (product: Product, delta: number) => void; onDelete?: (product: Product) => void; busyAction: string | null; owner?: boolean }) {
-  return <section className="overflow-hidden rounded-[25px] border border-[#dbe8e2] bg-white shadow-sm"><div className="flex flex-col justify-between gap-3 border-b border-[#edf2ef] p-4 sm:flex-row sm:items-center sm:p-5"><div><h2 className="text-lg font-black tracking-tight text-[#173f35]">{title}</h2><p className="mt-1 text-xs text-[#748a80]">{caption}</p></div><SearchInput query={query} onChange={onQueryChange} /></div><div className="divide-y divide-[#edf2ef]">{products.map((product) => { const stock = stockLabel(product.stock); const busy = busyAction === `stock-${product.id}` || busyAction === `delete-${product.id}`; return <div key={product.id} className="flex flex-wrap items-center gap-3 p-4 transition hover:bg-[#fbfdfb] sm:flex-nowrap sm:p-4.5"><ProductMark product={product} /><div className="min-w-[145px] flex-1"><p className="truncate text-sm font-black text-[#2a4c42]">{product.name}</p><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className="text-[11px] font-bold text-[#667e74]">กล่อง {price(product.price_box)}</span>{product.price_pack !== null && <><span className="text-[#bdcbc5]">·</span><span className="text-[11px] font-bold text-[#667e74]">แพ็ค {price(product.price_pack)}</span></>}</div></div><div className="ml-auto flex items-center gap-2"><span className={`rounded-lg px-2 py-1 text-[10px] font-black ${stock.className}`}>{stock.text}</span><span className="min-w-8 text-right text-sm font-black text-[#244b40]">{product.stock}</span></div><div className="flex items-center gap-1.5"><button disabled={busy || product.stock === 0} onClick={() => onAdjust(product, -1)} className="grid h-8 w-8 place-items-center rounded-lg border border-[#d6e5de] text-lg font-bold text-[#4e7064] transition hover:border-[#df9f85] hover:bg-[#fff5f0] hover:text-[#c85d39] disabled:cursor-not-allowed disabled:opacity-40">−</button><button disabled={busy} onClick={() => onAdjust(product, 1)} className="grid h-8 w-8 place-items-center rounded-lg bg-[#e5f3ed] text-lg font-bold text-[#0e715c] transition hover:bg-[#cfeade] disabled:cursor-not-allowed disabled:opacity-40">+</button>{owner && onDelete && <button disabled={busy} onClick={() => onDelete(product)} className="ml-1 grid h-8 w-8 place-items-center rounded-lg text-sm text-[#a17466] transition hover:bg-[#fff0ea] hover:text-[#c35130] disabled:opacity-40" aria-label={`ลบ ${product.name}`}>⌫</button>}</div></div>; })}</div>{!products.length && <EmptyState icon="⌕" title="ไม่พบสินค้า" text="ลองค้นหาด้วยคำอื่น หรือเพิ่มสินค้าใหม่" />}</section>;
+  const [quantities, setQuantities] = useState<Record<string, string>>({});
+  const addStock = (product: Product) => {
+    const quantity = Number(quantities[product.id]);
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_QUANTITY) return;
+    onAdjust(product, quantity);
+    setQuantities((current) => ({ ...current, [product.id]: "" }));
+  };
+
+  return <section className="overflow-hidden rounded-[25px] border border-[#dbe8e2] bg-white shadow-sm"><div className="flex flex-col justify-between gap-3 border-b border-[#edf2ef] p-4 sm:flex-row sm:items-center sm:p-5"><div><h2 className="text-lg font-black tracking-tight text-[#173f35]">{title}</h2><p className="mt-1 text-xs text-[#748a80]">{caption}</p></div><SearchInput query={query} onChange={onQueryChange} /></div><div className="divide-y divide-[#edf2ef]">{products.map((product) => { const stock = stockLabel(product.stock); const busy = busyAction === `stock-${product.id}` || busyAction === `delete-${product.id}`; const quantity = Number(quantities[product.id]); const canAdd = Number.isInteger(quantity) && quantity >= 1 && quantity <= MAX_QUANTITY; return <div key={product.id} className="flex flex-wrap items-center gap-3 p-4 transition hover:bg-[#fbfdfb] sm:flex-nowrap sm:p-4.5"><ProductMark product={product} /><div className="min-w-[145px] flex-1"><p className="truncate text-sm font-black text-[#2a4c42]">{product.name}</p><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className="text-[11px] font-bold text-[#667e74]">กล่อง {price(product.price_box)}</span>{product.price_pack !== null && <><span className="text-[#bdcbc5]">·</span><span className="text-[11px] font-bold text-[#667e74]">แพ็ค {price(product.price_pack)}</span></>}</div></div><div className="ml-auto flex items-center gap-2"><span className={`rounded-lg px-2 py-1 text-[10px] font-black ${stock.className}`}>{stock.text}</span><span className="min-w-8 text-right text-sm font-black text-[#244b40]">{product.stock}</span></div><div className="flex flex-wrap items-center justify-end gap-1.5"><button disabled={busy || product.stock === 0} onClick={() => onAdjust(product, -1)} className="grid h-8 w-8 place-items-center rounded-lg border border-[#d6e5de] text-lg font-bold text-[#4e7064] transition hover:border-[#df9f85] hover:bg-[#fff5f0] hover:text-[#c85d39] disabled:cursor-not-allowed disabled:opacity-40">−</button><button disabled={busy} onClick={() => onAdjust(product, 1)} className="grid h-8 w-8 place-items-center rounded-lg bg-[#e5f3ed] text-lg font-bold text-[#0e715c] transition hover:bg-[#cfeade] disabled:cursor-not-allowed disabled:opacity-40">+</button><input aria-label={`จำนวนที่จะเพิ่มสำหรับ ${product.name}`} value={quantities[product.id] || ""} onChange={(event) => setQuantities((current) => ({ ...current, [product.id]: event.target.value }))} type="number" min="1" max={MAX_QUANTITY} step="1" inputMode="numeric" placeholder="จำนวน" className="h-8 w-20 rounded-lg border border-[#d6e5de] bg-white px-2 text-center text-xs font-bold text-[#244b40] outline-none focus:border-[#1c8068]" /><button disabled={busy || !canAdd} onClick={() => addStock(product)} className="h-8 rounded-lg bg-[#0e4d43] px-2.5 text-xs font-extrabold text-white transition hover:bg-[#0a4038] disabled:cursor-not-allowed disabled:opacity-40">เพิ่ม</button>{owner && onDelete && <button disabled={busy} onClick={() => onDelete(product)} className="ml-1 grid h-8 w-8 place-items-center rounded-lg text-sm text-[#a17466] transition hover:bg-[#fff0ea] hover:text-[#c35130] disabled:opacity-40" aria-label={`ลบ ${product.name}`}>⌫</button>}</div></div>; })}</div>{!products.length && <EmptyState icon="⌕" title="ไม่พบสินค้า" text="ลองค้นหาด้วยคำอื่น หรือเพิ่มสินค้าใหม่" />}</section>;
 }
 
 function QuickActionCard({ title, text, action, glyph, tone, onClick }: { title: string; text: string; action: string; glyph: string; tone: string; onClick: () => void }) {
@@ -958,13 +982,13 @@ function Field({ label, hint, required, children, className = "" }: { label: str
   return <label className={`block ${className}`}><span className="mb-1.5 flex items-center gap-1 text-xs font-extrabold text-[#46645a]">{label}{required && <span className="text-[#e26b43]">*</span>}{hint && <span className="ml-1 font-medium text-[#93a49e]">({hint})</span>}</span>{children}</label>;
 }
 
-function RetailerProductCard({ product, boxes, packs, onChange }: { product: Product; boxes: number; packs: number; onChange: (product: Product, unit: "boxes" | "packs", delta: number) => void }) {
+function RetailerProductCard({ product, boxes, packs, onChange, onSetQuantity }: { product: Product; boxes: number; packs: number; onChange: (product: Product, unit: "boxes" | "packs", delta: number) => void; onSetQuantity: (product: Product, unit: "boxes" | "packs", value: number) => void }) {
   const stock = stockLabel(product.stock);
-  return <article className="rounded-2xl border border-[#e0ebe5] bg-[#fcfdfc] p-4 transition hover:-translate-y-0.5 hover:border-[#b9dace] hover:shadow-[0_10px_22px_rgba(17,70,58,.07)]"><div className="flex items-start gap-3"><ProductMark product={product} /><div className="min-w-0 flex-1"><p className="min-h-10 text-sm font-black leading-5 text-[#254a40]">{product.name}</p><span className={`mt-2 inline-block rounded-md px-2 py-1 text-[10px] font-black ${stock.className}`}>เหลือ {product.stock}</span></div></div><div className="mt-4 rounded-xl bg-[#f1f6f3] p-3"><PriceStepper label="กล่อง" value={boxes} valueLabel={price(product.price_box)} onDecrease={() => onChange(product, "boxes", -1)} onIncrease={() => onChange(product, "boxes", 1)} /><div className="my-2 border-t border-[#dce8e2]" />{product.price_pack !== null ? <PriceStepper label="แพ็ค" value={packs} valueLabel={price(product.price_pack)} onDecrease={() => onChange(product, "packs", -1)} onIncrease={() => onChange(product, "packs", 1)} /> : <div className="flex items-center justify-between text-[11px] font-semibold text-[#8a9d95]"><span>แพ็ค</span><span>ไม่มีราคาต่อแพ็ค</span></div>}</div></article>;
+  return <article className="rounded-2xl border border-[#e0ebe5] bg-[#fcfdfc] p-4 transition hover:-translate-y-0.5 hover:border-[#b9dace] hover:shadow-[0_10px_22px_rgba(17,70,58,.07)]"><div className="flex items-start gap-3"><ProductMark product={product} /><div className="min-w-0 flex-1"><p className="min-h-10 text-sm font-black leading-5 text-[#254a40]">{product.name}</p><span className={`mt-2 inline-block rounded-md px-2 py-1 text-[10px] font-black ${stock.className}`}>เหลือ {product.stock}</span></div></div><div className="mt-4 rounded-xl bg-[#f1f6f3] p-3"><PriceStepper label="กล่อง" value={boxes} valueLabel={price(product.price_box)} onDecrease={() => onChange(product, "boxes", -1)} onIncrease={() => onChange(product, "boxes", 1)} onSetValue={(value) => onSetQuantity(product, "boxes", value)} /><div className="my-2 border-t border-[#dce8e2]" />{product.price_pack !== null ? <PriceStepper label="แพ็ค" value={packs} valueLabel={price(product.price_pack)} onDecrease={() => onChange(product, "packs", -1)} onIncrease={() => onChange(product, "packs", 1)} onSetValue={(value) => onSetQuantity(product, "packs", value)} /> : <div className="flex items-center justify-between text-[11px] font-semibold text-[#8a9d95]"><span>แพ็ค</span><span>ไม่มีราคาต่อแพ็ค</span></div>}</div></article>;
 }
 
-function PriceStepper({ label, value, valueLabel, onDecrease, onIncrease }: { label: string; value: number; valueLabel: string; onDecrease: () => void; onIncrease: () => void }) {
-  return <div className="flex items-center gap-2"><div className="min-w-0 flex-1"><p className="text-[11px] font-black text-[#42665a]">{label}</p><p className="mt-0.5 text-xs font-black text-[#0e6957]">{valueLabel}</p></div><button disabled={value === 0} onClick={onDecrease} className="grid h-7 w-7 place-items-center rounded-lg bg-white text-base font-bold text-[#55776c] shadow-sm transition hover:bg-[#fff0ea] hover:text-[#c45c37] disabled:opacity-35">−</button><span className="grid h-7 min-w-7 place-items-center text-sm font-black text-[#214b40]">{value}</span><button onClick={onIncrease} className="grid h-7 w-7 place-items-center rounded-lg bg-[#0e4d43] text-base font-bold text-white shadow-sm transition hover:bg-[#0a4038]">+</button></div>;
+function PriceStepper({ label, value, valueLabel, onDecrease, onIncrease, onSetValue }: { label: string; value: number; valueLabel: string; onDecrease: () => void; onIncrease: () => void; onSetValue: (value: number) => void }) {
+  return <div className="flex items-center gap-2"><div className="min-w-0 flex-1"><p className="text-[11px] font-black text-[#42665a]">{label}</p><p className="mt-0.5 text-xs font-black text-[#0e6957]">{valueLabel}</p></div><button disabled={value === 0} onClick={onDecrease} className="grid h-7 w-7 place-items-center rounded-lg bg-white text-base font-bold text-[#55776c] shadow-sm transition hover:bg-[#fff0ea] hover:text-[#c45c37] disabled:opacity-35">−</button><input aria-label={`จำนวน${label}`} value={value} onChange={(event) => onSetValue(Number(event.target.value))} type="number" min="0" max={MAX_QUANTITY} step="1" inputMode="numeric" className="h-7 w-12 rounded-lg border border-[#d6e5de] bg-white px-1 text-center text-sm font-black text-[#214b40] outline-none focus:border-[#1c8068]" /><button onClick={onIncrease} className="grid h-7 w-7 place-items-center rounded-lg bg-[#0e4d43] text-base font-bold text-white shadow-sm transition hover:bg-[#0a4038]">+</button></div>;
 }
 
 function RetailerCartPanel({ cartLines, total, onChange, onCheckout, pending, standalone = false }: { cartLines: CartLine[]; total: number; onChange: (product: Product, unit: "boxes" | "packs", delta: number) => void; onCheckout: () => void; pending: boolean; standalone?: boolean }) {
@@ -1036,7 +1060,7 @@ function LiveLocationSharingCard({ order, active, error, onStart, onStop }: {
         </div>
         <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${active ? "bg-[#39ae77] shadow-[0_0_0_4px_rgba(57,174,119,.15)]" : "bg-[#b4c5bd]"}`} />
       </div>
-      {active && <p className="mt-3 rounded-xl bg-white/75 px-3 py-2 text-[11px] font-semibold leading-5 text-[#277057]">อัปเดตเมื่อขยับอย่างน้อย 25 ม. หรือทุก 15 วินาที โปรดเปิดหน้านี้ไว้ระหว่างนำส่ง</p>}
+      {active && <p className="mt-3 rounded-xl bg-white/75 px-3 py-2 text-[11px] font-semibold leading-5 text-[#277057]">อัปเดตเมื่อขยับอย่างน้อย 25 ม. หรือทุก 15 วินาที โปรดเปิดหน้านี้ไว้ระหว่างนำส่ง ระบบจะหยุดเมื่อกดหยุดแชร์, ปิด/รีเฟรชหน้า, ออกจากระบบ หรือกดส่งสำเร็จ</p>}
       {error && <p className="mt-3 rounded-xl bg-[#fff1ec] px-3 py-2 text-[11px] font-semibold leading-5 text-[#b95634]">{error}</p>}
       <div className="mt-3 flex flex-col gap-2 sm:flex-row">
         {active ? (
