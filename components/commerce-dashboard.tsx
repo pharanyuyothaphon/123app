@@ -157,8 +157,8 @@ function dateTime(value: string) {
 }
 
 function stockLabel(stock: number) {
-  if (stock <= 12) return { text: "ต้องเติม", className: "bg-[#fff0e9] text-[#c45c37]" };
-  if (stock <= 24) return { text: "ใกล้หมด", className: "bg-[#fff5da] text-[#9f7017]" };
+  if (stock < 5) return { text: "เติมด่วน", className: "bg-[#fff0e9] text-[#c45c37]" };
+  if (stock < 10) return { text: "ใกล้หมด", className: "bg-[#fff5da] text-[#9f7017]" };
   return { text: "พร้อมขาย", className: "bg-[#e6f5eb] text-[#227654]" };
 }
 
@@ -355,7 +355,7 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
   const cartCount = useMemo(() => cartLines.reduce((total, line) => total + line.boxes + line.packs, 0), [cartLines]);
   const pendingOrders = useMemo(() => orders.filter((order) => order.status === "PENDING").length, [orders]);
   const deliveringOrders = useMemo(() => orders.filter((order) => order.status === "DELIVERING").length, [orders]);
-  const lowStock = useMemo(() => products.filter((product) => product.stock <= 20), [products]);
+  const lowStock = useMemo(() => products.filter((product) => product.stock < 10), [products]);
 
   const updateLocalOrderStatus = (orderId: string, status: OrderStatus) => {
     setOrders((current) => current.map((order) => (order.id === orderId ? { ...order, status, assigned_employee_id: session?.user.id || "e-1" } : order)));
