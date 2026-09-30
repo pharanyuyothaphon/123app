@@ -64,6 +64,7 @@ export async function GET() {
 
     const canViewOrders = auth.profile.role === "OWNER" || auth.profile.role === "EMPLOYEE" || auth.profile.role === "RETAILER";
     const canViewReceipts = auth.profile.role === "OWNER" || auth.profile.role === "RETAILER";
+    const canViewCatalog = auth.profile.role !== "EMPLOYEE";
     const filteredOrderQuery = auth.profile.role === "RETAILER"
       ? `${orderQuery}&retailer_id=eq.${encodeURIComponent(auth.user.id)}`
       : orderQuery;
@@ -72,8 +73,8 @@ export async function GET() {
       : receiptQuery;
 
     const [products, categories, rawOrders, rawReceipts, rawTracking, retailers] = await Promise.all([
-      adminRequest<Product[]>(productQuery),
-      adminRequest<ProductCategory[]>(categoryQuery),
+      canViewCatalog ? adminRequest<Product[]>(productQuery) : Promise.resolve([] as Product[]),
+      canViewCatalog ? adminRequest<ProductCategory[]>(categoryQuery) : Promise.resolve([] as ProductCategory[]),
       canViewOrders ? adminRequest<RawOrder[]>(filteredOrderQuery) : Promise.resolve([] as RawOrder[]),
       canViewReceipts ? adminRequest<RawReceipt[]>(filteredReceiptQuery) : Promise.resolve([] as RawReceipt[]),
       canViewOrders ? adminRequest<RawTracking[]>(trackingQuery) : Promise.resolve([] as RawTracking[]),

@@ -1,13 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { Brand } from "@/components/brand";
 import { signInWithPhone } from "@/lib/supabase";
 
 export default function LoginPage() {
-  const router = useRouter();
   const [phone, setPhone] = useState("");
   const [password, setPassword] = useState("");
   const [pending, setPending] = useState(false);
@@ -20,7 +18,10 @@ export default function LoginPage() {
     setPending(true);
     try {
       const result = await signInWithPhone(phone, password);
-      router.replace(result.redirectTo);
+      // The login response has just set an httpOnly session cookie. A full
+      // navigation makes the next request reliably include that cookie and
+      // avoids reusing an App Router payload that may be stale after deploy.
+      window.location.assign(result.redirectTo);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "เข้าสู่ระบบไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
     } finally {
