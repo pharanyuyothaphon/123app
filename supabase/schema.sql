@@ -1,5 +1,5 @@
 -- 123พาณิชย์ปลีกส่ง · Supabase schema (ฐานข้อมูลเริ่มต้น)
--- หลังรันไฟล์นี้ ต้องรัน custom-auth-migration.sql ต่อเสมอ
+-- หลังรันไฟล์นี้ ต้องรัน custom-auth-migration.sql และ migrations/20260906_daily_receipts_categories_checkout_stock.sql ต่อเสมอ
 
 create extension if not exists "pgcrypto";
 
@@ -24,6 +24,7 @@ create table if not exists public.profiles (
 create table if not exists public.products (
   id uuid primary key default gen_random_uuid(),
   name text not null check (char_length(trim(name)) > 0),
+  category text not null default 'ทั่วไป' check (char_length(trim(category)) between 1 and 80),
   price_box numeric(12, 2) not null check (price_box >= 0),
   price_pack numeric(12, 2) check (price_pack is null or price_pack >= 0),
   stock integer not null default 0 check (stock >= 0),
@@ -31,20 +32,49 @@ create table if not exists public.products (
   created_by uuid references public.profiles(id) on delete set null
 );
 
+create table if not exists public.daily_receipts (
+  id uuid primary key default gen_random_uuid(),
+  retailer_id uuid not null references public.profiles(id) on delete restrict,
+  receipt_date date not null default ((now() at time zone 'Asia/Bangkok')::date),
+  total_amount numeric(12, 2) not null default 0 check (total_amount >= 0),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (retailer_id, receipt_date)
+);
+
 create table if not exists public.orders (
   id uuid primary key default gen_random_uuid(),
   retailer_id uuid not null references public.profiles(id) on delete restrict,
+  receipt_id uuid references public.daily_receipts(id) on delete restrict,
   assigned_employee_id uuid references public.profiles(id) on delete set null,
   status public.order_status not null default 'PENDING',
   total_amount numeric(12, 2) not null default 0 check (total_amount >= 0),
+  stock_deducted_at timestamptz,
+  checkout_request_id uuid,
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  constraint orders_retailer_checkout_request_key unique (retailer_id, checkout_request_id)
 );
 
 create table if not exists public.order_items (
   id uuid primary key default gen_random_uuid(),
   order_id uuid not null references public.orders(id) on delete cascade,
   product_id uuid references public.products(id) on delete set null,
+  product_name text not null default 'สินค้าที่ลบออกจากคลัง',
+  quantity_box integer not null default 0 check (quantity_box >= 0),
+  quantity_pack integer not null default 0 check (quantity_pack >= 0),
+  unit_price_box numeric(12, 2) not null check (unit_price_box >= 0),
+  unit_price_pack numeric(12, 2) check (unit_price_pack is null or unit_price_pack >= 0),
+  line_total numeric(12, 2) not null check (line_total >= 0),
+  check (quantity_box > 0 or quantity_pack > 0)
+);
+
+create table if not exists public.receipt_items (
+  id uuid primary key default gen_random_uuid(),
+  receipt_id uuid not null references public.daily_receipts(id) on delete cascade,
+  product_id uuid references public.products(id) on delete set null,
+  product_name text not null,
+  category text not null default 'ทั่วไป',
   quantity_box integer not null default 0 check (quantity_box >= 0),
   quantity_pack integer not null default 0 check (quantity_pack >= 0),
   unit_price_box numeric(12, 2) not null check (unit_price_box >= 0),
@@ -62,9 +92,13 @@ create table if not exists public.delivery_tracking (
 );
 
 create index if not exists products_stock_idx on public.products(stock asc);
+create index if not exists products_category_idx on public.products(category);
 create index if not exists orders_retailer_created_idx on public.orders(retailer_id, created_at desc);
+create index if not exists orders_receipt_idx on public.orders(receipt_id);
 create index if not exists orders_status_idx on public.orders(status);
 create index if not exists order_items_order_idx on public.order_items(order_id);
+create index if not exists daily_receipts_retailer_date_idx on public.daily_receipts(retailer_id, receipt_date desc);
+create index if not exists receipt_items_receipt_idx on public.receipt_items(receipt_id);
 
 create or replace function public.set_updated_at()
 returns trigger
@@ -80,6 +114,11 @@ $$;
 drop trigger if exists orders_updated_at on public.orders;
 create trigger orders_updated_at
 before update on public.orders
+for each row execute procedure public.set_updated_at();
+
+drop trigger if exists daily_receipts_updated_at on public.daily_receipts;
+create trigger daily_receipts_updated_at
+before update on public.daily_receipts
 for each row execute procedure public.set_updated_at();
 
 drop trigger if exists delivery_tracking_updated_at on public.delivery_tracking;
@@ -128,6 +167,8 @@ $$;
 
 alter table public.profiles enable row level security;
 alter table public.products enable row level security;
+alter table public.daily_receipts enable row level security;
+alter table public.receipt_items enable row level security;
 alter table public.orders enable row level security;
 alter table public.order_items enable row level security;
 alter table public.delivery_tracking enable row level security;
@@ -145,6 +186,25 @@ drop policy if exists "authenticated product read" on public.products;
 create policy "authenticated product read"
 on public.products for select to authenticated
 using (true);
+
+drop policy if exists "daily receipt visibility by role" on public.daily_receipts;
+create policy "daily receipt visibility by role"
+on public.daily_receipts for select to authenticated
+using (
+  retailer_id = auth.uid()
+  or public.get_my_role() = 'OWNER'
+);
+
+drop policy if exists "receipt item visibility follows receipt" on public.receipt_items;
+create policy "receipt item visibility follows receipt"
+on public.receipt_items for select to authenticated
+using (
+  exists (
+    select 1 from public.daily_receipts as receipt
+    where receipt.id = receipt_items.receipt_id
+      and (receipt.retailer_id = auth.uid() or public.get_my_role() = 'OWNER')
+  )
+);
 
 drop policy if exists "owner product insert" on public.products;
 create policy "owner product insert"
@@ -423,8 +483,10 @@ revoke execute on function public.create_retailer_order(jsonb) from public;
 revoke execute on function public.update_delivery_status(uuid, public.order_status) from public;
 grant execute on function public.get_my_role() to authenticated;
 grant execute on function public.admin_adjust_stock(uuid, integer) to authenticated;
-grant execute on function public.create_retailer_order(jsonb) to authenticated;
-grant execute on function public.update_delivery_status(uuid, public.order_status) to authenticated;
+-- Checkout and delivery mutations are exposed through the Custom Auth service RPCs.
+-- Keep legacy authenticated RPCs closed so they cannot bypass daily receipts or checkout-time stock deduction.
+revoke execute on function public.create_retailer_order(jsonb) from authenticated;
+revoke execute on function public.update_delivery_status(uuid, public.order_status) from authenticated;
 
 do $$ begin
   alter publication supabase_realtime add table public.orders;

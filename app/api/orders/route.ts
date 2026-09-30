@@ -17,9 +17,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ message: "เฉพาะผู้ค้าปลีกเท่านั้นที่สั่งซื้อได้" }, { status: 403 });
   }
 
-  let input: { items?: unknown };
+  let input: { items?: unknown; requestId?: unknown };
   try {
-    input = (await request.json()) as { items?: unknown };
+    input = (await request.json()) as { items?: unknown; requestId?: unknown };
   } catch {
     return NextResponse.json({ message: "รูปแบบข้อมูลไม่ถูกต้อง" }, { status: 400 });
   }
@@ -42,12 +42,22 @@ export async function POST(request: Request) {
     return NextResponse.json({ message: "จำนวนสินค้าที่เลือกไม่ถูกต้อง" }, { status: 400 });
   }
 
+  const requestId = typeof input.requestId === "string" ? input.requestId : "";
+  if (!uuidPattern.test(requestId)) {
+    return NextResponse.json({ message: "รหัสยืนยันคำสั่งซื้อไม่ถูกต้อง" }, { status: 400 });
+  }
+
   try {
-    const orderId = await serverRpc<string>("custom_create_retailer_order", {
+    const result = await serverRpc<{ order_id?: unknown; receipt_id?: unknown } | Array<{ order_id?: unknown; receipt_id?: unknown }>>("custom_create_retailer_order", {
       p_retailer_id: auth.user.id,
       p_items: items,
+      p_request_id: requestId,
     });
-    return NextResponse.json({ orderId }, { status: 201 });
+    const created = Array.isArray(result) ? result[0] : result;
+    if (!created || typeof created.order_id !== "string" || typeof created.receipt_id !== "string") {
+      throw new Error("ระบบสร้างใบเสร็จไม่สมบูรณ์");
+    }
+    return NextResponse.json({ orderId: created.order_id, receiptId: created.receipt_id }, { status: 201 });
   } catch (error) {
     return NextResponse.json(
       { message: error instanceof Error ? error.message : "ไม่สามารถสร้างคำสั่งซื้อได้" },

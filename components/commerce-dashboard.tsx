@@ -18,6 +18,7 @@ import {
 import type {
   AppSession,
   CartLine,
+  DailyReceipt,
   DashboardSnapshot,
   DashboardView,
   DeliveryTracking,
@@ -29,14 +30,16 @@ import type {
 } from "@/lib/types";
 
 type CartState = Record<string, { boxes: number; packs: number }>;
-type ProductDraft = { name: string; priceBox: string; pricePack: string; stock: string };
+type ProductDraft = { name: string; category: string; priceBox: string; pricePack: string; stock: string };
 type SharedLocation = { orderId: string; latitude: number; longitude: number; sentAt: number };
 
 const LOCATION_MIN_SEND_GAP_MS = 5_000;
 const LOCATION_SEND_INTERVAL_MS = 15_000;
 const LOCATION_MIN_DISTANCE_METERS = 25;
 const RETAILER_CART_STORAGE_PREFIX = "123-commerce:retailer-cart:";
+const RETAILER_CHECKOUT_REQUEST_STORAGE_PREFIX = "123-commerce:retailer-checkout-request:";
 const MAX_QUANTITY = 10_000;
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const roleMeta: Record<Role, { label: string; title: string; description: string; glyph: string; accent: string }> = {
   OWNER: {
@@ -111,10 +114,23 @@ const viewTitle: Record<DashboardView, { title: string; subtitle: string }> = {
   cart: { title: "ตะกร้าสินค้าของฉัน", subtitle: "ตรวจสอบรายการและยอดรวมก่อนยืนยันคำสั่งซื้อ" },
 };
 
-const createEmptyDraft = (): ProductDraft => ({ name: "", priceBox: "", pricePack: "", stock: "0" });
+const createEmptyDraft = (): ProductDraft => ({ name: "", category: "ทั่วไป", priceBox: "", pricePack: "", stock: "0" });
 
 function retailerCartStorageKey(retailerId: string) {
   return `${RETAILER_CART_STORAGE_PREFIX}${retailerId}`;
+}
+
+function retailerCheckoutRequestStorageKey(retailerId: string) {
+  return `${RETAILER_CHECKOUT_REQUEST_STORAGE_PREFIX}${retailerId}`;
+}
+
+function checkoutRequestId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (character) => {
+    const random = Math.floor(Math.random() * 16);
+    const value = character === "x" ? random : (random & 0x3) | 0x8;
+    return value.toString(16);
+  });
 }
 
 function restoreCart(rawValue: string | null): CartState {
@@ -153,11 +169,32 @@ function dateTime(value: string) {
     month: "short",
     hour: "2-digit",
     minute: "2-digit",
+    timeZone: "Asia/Bangkok",
   }).format(new Date(value));
 }
 
+function thailandDateKey(value = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    timeZone: "Asia/Bangkok",
+  }).formatToParts(value);
+  const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === type)?.value || "";
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
+function receiptDate(value: string) {
+  return new Intl.DateTimeFormat("th-TH", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    timeZone: "Asia/Bangkok",
+  }).format(new Date(`${value}T12:00:00+07:00`));
+}
+
 function stockLabel(stock: number) {
-  if (stock < 5) return { text: "เติมด่วน", className: "bg-[#fff0e9] text-[#c45c37]" };
+  if (stock < 5) return { text: "เติมด่วน", className: "bg-red-600 text-white" };
   if (stock < 10) return { text: "ใกล้หมด", className: "bg-[#fff5da] text-[#9f7017]" };
   return { text: "พร้อมขาย", className: "bg-[#e6f5eb] text-[#227654]" };
 }
@@ -206,13 +243,17 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
   const [session, setSession] = useState<AppSession | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
+  const [receipts, setReceipts] = useState<DailyReceipt[]>([]);
   const [retailers, setRetailers] = useState<Retailer[]>([]);
   const [activeView, setActiveView] = useState<DashboardView>("overview");
   const [query, setQuery] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("");
   const [cart, setCart] = useState<CartState>({});
+  const [pendingCheckoutRequestId, setPendingCheckoutRequestId] = useState<string | null>(null);
   const [cartReadyFor, setCartReadyFor] = useState<string | null>(null);
   const [draft, setDraft] = useState<ProductDraft>(createEmptyDraft);
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
+  const [selectedReceiptId, setSelectedReceiptId] = useState<string | null>(null);
   const [selectedRetailerId, setSelectedRetailerId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -222,10 +263,12 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
   const lastSharedLocationRef = useRef<SharedLocation | null>(null);
   const trackingRequestInFlightRef = useRef(false);
   const cartStorageKey = role === "RETAILER" && identity?.id ? retailerCartStorageKey(identity.id) : null;
+  const checkoutRequestStorageKey = role === "RETAILER" && identity?.id ? retailerCheckoutRequestStorageKey(identity.id) : null;
 
   const applySnapshot = useCallback((snapshot: DashboardSnapshot) => {
     setProducts([...snapshot.products].sort((a, b) => a.stock - b.stock));
     setOrders(snapshot.orders);
+    setReceipts(snapshot.receipts);
     setRetailers(snapshot.retailers);
   }, []);
 
@@ -294,33 +337,43 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
   }, [refreshLiveData, role, session]);
 
   useEffect(() => {
-    if (!cartStorageKey) {
+    if (!cartStorageKey || !checkoutRequestStorageKey) {
       setCart({});
+      setPendingCheckoutRequestId(null);
       setCartReadyFor(null);
       return;
     }
 
     try {
       setCart(restoreCart(window.localStorage.getItem(cartStorageKey)));
+      const storedRequestId = window.localStorage.getItem(checkoutRequestStorageKey);
+      setPendingCheckoutRequestId(storedRequestId && uuidPattern.test(storedRequestId) ? storedRequestId : null);
     } catch {
       setCart({});
+      setPendingCheckoutRequestId(null);
     }
     setCartReadyFor(cartStorageKey);
-  }, [cartStorageKey]);
+  }, [cartStorageKey, checkoutRequestStorageKey]);
 
   useEffect(() => {
-    if (!cartStorageKey || cartReadyFor !== cartStorageKey) return;
+    if (!cartStorageKey || !checkoutRequestStorageKey || cartReadyFor !== cartStorageKey) return;
 
     try {
       if (Object.keys(cart).length) {
         window.localStorage.setItem(cartStorageKey, JSON.stringify(cart));
+        if (pendingCheckoutRequestId) {
+          window.localStorage.setItem(checkoutRequestStorageKey, pendingCheckoutRequestId);
+        } else {
+          window.localStorage.removeItem(checkoutRequestStorageKey);
+        }
       } else {
         window.localStorage.removeItem(cartStorageKey);
+        window.localStorage.removeItem(checkoutRequestStorageKey);
       }
     } catch {
       // Browser privacy settings may disable local storage; ordering still works normally.
     }
-  }, [cart, cartReadyFor, cartStorageKey]);
+  }, [cart, cartReadyFor, cartStorageKey, checkoutRequestStorageKey, pendingCheckoutRequestId]);
 
   useEffect(() => () => stopLiveLocationTracking(false), [stopLiveLocationTracking]);
 
@@ -333,9 +386,15 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
   const matchingProducts = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase("th-TH");
     return [...products]
-      .filter((product) => product.name.toLocaleLowerCase("th-TH").includes(normalized))
+      .filter((product) => product.name.toLocaleLowerCase("th-TH").includes(normalized) || (product.category || "").toLocaleLowerCase("th-TH").includes(normalized))
+      .filter((product) => !categoryFilter || product.category === categoryFilter)
       .sort((a, b) => a.stock - b.stock);
-  }, [products, query]);
+  }, [categoryFilter, products, query]);
+
+  const productCategories = useMemo(
+    () => Array.from(new Set(products.map((product) => product.category || "").filter(Boolean))).sort((left, right) => left.localeCompare(right, "th-TH")),
+    [products],
+  );
 
   const cartLines = useMemo<CartLine[]>(() => {
     return Object.entries(cart)
@@ -356,6 +415,11 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
   const pendingOrders = useMemo(() => orders.filter((order) => order.status === "PENDING").length, [orders]);
   const deliveringOrders = useMemo(() => orders.filter((order) => order.status === "DELIVERING").length, [orders]);
   const lowStock = useMemo(() => products.filter((product) => product.stock < 10), [products]);
+  const todayReceiptDate = thailandDateKey();
+  const todayReceipts = useMemo(
+    () => receipts.filter((receipt) => receipt.receipt_date === todayReceiptDate),
+    [receipts, todayReceiptDate],
+  );
 
   const updateLocalOrderStatus = (orderId: string, status: OrderStatus) => {
     setOrders((current) => current.map((order) => (order.id === orderId ? { ...order, status, assigned_employee_id: session?.user.id || "e-1" } : order)));
@@ -417,14 +481,15 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     const priceBox = Number(draft.priceBox);
     const pricePack = draft.pricePack.trim() ? Number(draft.pricePack) : null;
     const stock = Math.max(0, Number(draft.stock || 0));
-    if (!draft.name.trim() || !Number.isFinite(priceBox) || priceBox < 0 || (pricePack !== null && (!Number.isFinite(pricePack) || pricePack < 0))) {
-      notify("กรุณาระบุชื่อสินค้าและราคากล่องให้ถูกต้อง");
+    if (!draft.name.trim() || !draft.category.trim() || !Number.isFinite(priceBox) || priceBox < 0 || (pricePack !== null && (!Number.isFinite(pricePack) || pricePack < 0))) {
+      notify("กรุณาระบุชื่อสินค้า ประเภทสินค้า และราคากล่องให้ถูกต้อง");
       return;
     }
 
     const optimistic: Product = {
       id: `local-${Date.now()}`,
       name: draft.name.trim(),
+      category: draft.category.trim(),
       price_box: priceBox,
       price_pack: pricePack,
       stock,
@@ -438,6 +503,7 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     try {
       const created = await addProduct(session, {
         name: optimistic.name,
+        category: optimistic.category,
         price_box: optimistic.price_box,
         price_pack: optimistic.price_pack,
         stock: optimistic.stock,
@@ -455,6 +521,11 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
 
   const changeCart = (product: Product, unit: "boxes" | "packs", delta: number) => {
     if (unit === "packs" && product.price_pack === null) return;
+    if (pendingCheckoutRequestId) {
+      notify("กำลังรอยืนยันคำสั่งซื้อเดิม กรุณากดยืนยันอีกครั้งก่อนแก้ไขตะกร้า");
+      return;
+    }
+    setPendingCheckoutRequestId(null);
     setCart((current) => {
       const present = current[product.id] || { boxes: 0, packs: 0 };
       const next = { ...present, [unit]: Math.min(MAX_QUANTITY, Math.max(0, present[unit] + delta)) };
@@ -469,6 +540,11 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
 
   const setCartQuantity = (product: Product, unit: "boxes" | "packs", value: number) => {
     if (unit === "packs" && product.price_pack === null) return;
+    if (pendingCheckoutRequestId) {
+      notify("กำลังรอยืนยันคำสั่งซื้อเดิม กรุณากดยืนยันอีกครั้งก่อนแก้ไขตะกร้า");
+      return;
+    }
+    setPendingCheckoutRequestId(null);
     const quantity = Math.min(MAX_QUANTITY, Math.max(0, Math.floor(value)));
     setCart((current) => {
       const present = current[product.id] || { boxes: 0, packs: 0 };
@@ -493,20 +569,24 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     }
 
     setBusyAction("checkout");
+    const requestId = pendingCheckoutRequestId || checkoutRequestId();
+    setPendingCheckoutRequestId(requestId);
     try {
-      const orderId = await createRetailerOrder(
+      const created = await createRetailerOrder(
         session,
         cartLines.map((line) => ({ product_id: line.product.id, quantity_box: line.boxes, quantity_pack: line.packs })),
+        requestId,
       );
       setCart({});
-      setSelectedOrderId(orderId);
+      setPendingCheckoutRequestId(null);
+      setSelectedReceiptId(created.receiptId);
       setActiveView("cart");
 
       try {
         if (role) await refreshLiveData(session, role);
-        notify("ยืนยันคำสั่งซื้อแล้ว ดูรายละเอียดได้ในหน้าตะกร้า");
+        notify("ยืนยันคำสั่งซื้อและตัดสต๊อกจากคลังแล้ว รายการจะรวมในใบเสร็จของวันนี้");
       } catch {
-        notify("ยืนยันคำสั่งซื้อแล้ว แต่ยังโหลดรายละเอียดล่าสุดไม่สำเร็จ โปรดเปิดตะกร้าอีกครั้ง");
+        notify("ยืนยันคำสั่งซื้อและตัดสต๊อกแล้ว แต่ยังโหลดใบเสร็จล่าสุดไม่สำเร็จ โปรดเปิดตะกร้าอีกครั้ง");
       }
     } catch (error) {
       notify(error instanceof Error ? error.message : "ไม่สามารถยืนยันคำสั่งซื้อได้");
@@ -525,22 +605,13 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     try {
       await updateDeliveryStatus(session, order.id, status);
 
-      // The stock change happens in Supabase's transaction. Re-fetch the snapshot
-      // rather than calculating a local decrement, so the dashboard always shows
-      // the database's current value even when more than one employee is working.
+      // Stock is deducted at retailer checkout. Re-fetch to show the server's
+      // latest delivery status without calculating stock changes in the client.
       try {
         if (role) await refreshLiveData(session, role);
-        notify(
-          status === "DELIVERING"
-            ? "เริ่มนำส่งสินค้าและตัดสต็อกจากคลังเรียบร้อยแล้ว"
-            : statusMeta[status].label,
-        );
+        notify(statusMeta[status].label);
       } catch {
-        notify(
-          status === "DELIVERING"
-            ? "เริ่มนำส่งสินค้าและตัดสต็อกแล้ว แต่ยังโหลดจำนวนล่าสุดไม่สำเร็จ"
-            : `${statusMeta[status].label}แล้ว แต่ยังโหลดข้อมูลล่าสุดไม่สำเร็จ`,
-        );
+        notify(`${statusMeta[status].label}แล้ว แต่ยังโหลดข้อมูลล่าสุดไม่สำเร็จ`);
       }
 
       if (status === "COMPLETED" && activeTrackingOrderId === order.id) {
@@ -663,7 +734,7 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
   const meta = roleMeta[role];
   const navItems = navByRole[role];
   const currentView = viewTitle[activeView];
-  const currentOrder = orders.find((order) => order.id === selectedOrderId) || orders[0] || null;
+  const currentReceipt = receipts.find((receipt) => receipt.id === selectedReceiptId) || receipts[0] || null;
   const allRetailers: Retailer[] = retailers.length
     ? retailers
     : Array.from(
@@ -678,9 +749,12 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
   const renderOwner = () => {
     if (activeView === "orders") {
       return (
-        <div className="grid gap-5 xl:grid-cols-[1.03fr_.97fr]">
-          <OrderList orders={orders} selectedId={currentOrder?.id || null} onSelect={setSelectedOrderId} />
-          <OrderDetail order={currentOrder} />
+        <div className="space-y-5">
+          <SalesSummary receipts={receipts} title="สรุปยอดขายของร้านวันนี้" description="ยอดขายและจำนวนใบเสร็จรวมจากผู้ค้าปลีกทุกสาขา" />
+          <div className="grid gap-5 xl:grid-cols-[1.03fr_.97fr]">
+            <ReceiptList receipts={receipts} selectedId={currentReceipt?.id || null} onSelect={setSelectedReceiptId} />
+            <ReceiptDetail receipt={currentReceipt} />
+          </div>
         </div>
       );
     }
@@ -697,6 +771,7 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
             { label: "รายการสินค้าทั้งหมด", value: products.length.toString(), note: "เรียงสินค้าน้อยสุดก่อน", glyph: "▦", tone: "bg-[#e5f3ed] text-[#0e725e]" },
             { label: "สินค้าใกล้หมด", value: lowStock.length.toString(), note: "ควรตรวจสอบและเติมสินค้า", glyph: "!", tone: "bg-[#fff0e9] text-[#c45c37]" },
             { label: "กำลังนำส่ง", value: deliveringOrders.toString(), note: "ติดตามพนักงานได้ทันที", glyph: "⌁", tone: "bg-[#eeeefc] text-[#5963a4]" },
+            { label: "ยอดขายวันนี้", value: price(todayReceipts.reduce((total, receipt) => total + receipt.total_amount, 0)), note: `${todayReceipts.length} ใบเสร็จ`, glyph: "฿", tone: "bg-[#e5f3ed] text-[#0e725e]" },
           ]}
         />
         <div className="mt-5 grid gap-5 2xl:grid-cols-[1.2fr_.8fr]">
@@ -720,21 +795,21 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
               tone="bg-[#0e4d43]"
               onClick={() => setActiveView("tracking")}
             />
-            <div className="rounded-[25px] border border-[#dbe8e2] bg-white p-5 shadow-sm">
+            <div className="rounded-[25px] border border-red-200 bg-red-50 p-5 shadow-sm">
               <div className="flex items-start justify-between gap-3">
-                <div><p className="text-sm font-black text-[#183d34]">แจ้งเตือนสินค้าใกล้หมด</p><p className="mt-1 text-xs leading-5 text-[#71867e]">ตรวจสอบก่อนสินค้าหมดหน้าร้าน</p></div>
-                <span className="rounded-xl bg-[#fff0e9] px-2.5 py-1 text-[11px] font-black text-[#c45c37]">{lowStock.length} รายการ</span>
+                <div><p className="text-sm font-black text-red-800">แจ้งเตือนสินค้าใกล้หมด</p><p className="mt-1 text-xs leading-5 text-red-700">ตรวจสอบก่อนสินค้าหมดหน้าร้าน</p></div>
+                <span className="rounded-xl bg-red-600 px-2.5 py-1 text-[11px] font-black text-white">{lowStock.length} รายการ</span>
               </div>
               <div className="mt-4 space-y-3">
                 {lowStock.slice(0, 4).map((product) => (
-                  <button key={product.id} onClick={() => setQuery(product.name)} className="flex w-full items-center gap-3 rounded-xl px-1 text-left transition hover:bg-[#f7faf8]">
+                  <button key={product.id} onClick={() => setQuery(product.name)} className="flex w-full items-center gap-3 rounded-xl px-1 text-left transition hover:bg-red-100">
                     <ProductMark product={product} size="sm" />
-                    <span className="min-w-0 flex-1 truncate text-xs font-bold text-[#456157]">{product.name}</span>
-                    <span className="text-xs font-black text-[#c45c37]">{product.stock}</span>
+                    <span className="min-w-0 flex-1 truncate text-xs font-bold text-red-900">{product.name}</span>
+                    <span className="text-xs font-black text-red-700">{product.stock}</span>
                   </button>
                 ))}
               </div>
-              <button onClick={() => setQuery("")} className="mt-5 text-xs font-extrabold text-[#0e715c]">ดูสินค้าทั้งหมด →</button>
+              <button onClick={() => setQuery("")} className="mt-5 rounded-lg bg-red-600 px-3 py-2 text-xs font-extrabold text-white transition hover:bg-red-700 focus:outline-none focus:ring-4 focus:ring-red-200">ดูสินค้าทั้งหมด →</button>
             </div>
           </aside>
         </div>
@@ -842,7 +917,8 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
 
   const renderRetailer = () => {
     const ownOrders = orders.filter((order) => order.retailer_id === (identity?.id || "r-1"));
-    const selectedRetailerOrder = ownOrders.find((order) => order.id === selectedOrderId) || ownOrders[0] || null;
+    const ownReceipts = receipts.filter((receipt) => receipt.retailer_id === (identity?.id || "r-1"));
+    const selectedRetailerReceipt = ownReceipts.find((receipt) => receipt.id === selectedReceiptId) || ownReceipts[0] || null;
 
     if (activeView === "tracking") {
       return <TrackingWorkspace orders={ownOrders.length ? ownOrders : orders.filter((order) => order.retailer_id === "r-1")} title="ติดตามพนักงาน" caption="ตรวจสอบตำแหน่งล่าสุดของพนักงานที่กำลังนำส่งให้ร้านของคุณ" />;
@@ -850,27 +926,31 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     if (activeView === "cart") {
       return (
         <div className="space-y-5">
-          <RetailerCartPanel cartLines={cartLines} total={cartTotal} onChange={changeCart} onCheckout={checkout} pending={busyAction === "checkout"} standalone />
-          <RetailerOrderHistory orders={ownOrders} selectedOrder={selectedRetailerOrder} onSelect={setSelectedOrderId} />
+          <RetailerCartPanel cartLines={cartLines} total={cartTotal} onChange={changeCart} onCheckout={checkout} pending={busyAction === "checkout"} retrying={Boolean(pendingCheckoutRequestId)} standalone />
+          <SalesSummary receipts={ownReceipts} title="สรุปยอดซื้อของร้านวันนี้" description="รายการที่ยืนยันในวันเดียวกันจะรวมอยู่ในใบเสร็จฉบับเดียว" />
+          <RetailerReceiptHistory receipts={ownReceipts} selectedReceipt={selectedRetailerReceipt} onSelect={setSelectedReceiptId} />
         </div>
       );
     }
     return (
-      <div className="grid gap-5 2xl:grid-cols-[1fr_350px]">
-        <section className="rounded-[25px] border border-[#dbe8e2] bg-white p-4 shadow-sm sm:p-5">
-          <div className="flex flex-col justify-between gap-3 border-b border-[#edf2ef] pb-4 sm:flex-row sm:items-center">
-            <div><p className="text-lg font-black tracking-tight text-[#173e34]">สินค้าในระบบ</p><p className="mt-1 text-xs text-[#71877e]">เลือกซื้อได้แบบกล่อง และแพ็คเมื่อมีราคา</p></div>
-            <SearchInput query={query} onChange={setQuery} />
-          </div>
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            {matchingProducts.map((product) => {
-              const amount = cart[product.id] || { boxes: 0, packs: 0 };
-              return <RetailerProductCard key={product.id} product={product} boxes={amount.boxes} packs={amount.packs} onChange={changeCart} onSetQuantity={setCartQuantity} />;
-            })}
-          </div>
-          {!matchingProducts.length && <EmptyState icon="⌕" title="ไม่พบสินค้า" text="ลองค้นหาด้วยชื่อสินค้าอื่น" />}
-        </section>
-        <RetailerCartPanel cartLines={cartLines} total={cartTotal} onChange={changeCart} onCheckout={checkout} pending={busyAction === "checkout"} />
+      <div className="space-y-5">
+        <SalesSummary receipts={ownReceipts} title="สรุปยอดซื้อของร้านวันนี้" description="ดูยอดรวมและใบเสร็จรายวันได้จากเมนูตะกร้าของฉัน" compact />
+        <div className="grid gap-5 2xl:grid-cols-[1fr_350px]">
+          <section className="rounded-[25px] border border-[#dbe8e2] bg-white p-4 shadow-sm sm:p-5">
+            <div className="flex flex-col justify-between gap-3 border-b border-[#edf2ef] pb-4 sm:flex-row sm:items-center">
+              <div><p className="text-lg font-black tracking-tight text-[#173e34]">สินค้าในระบบ</p><p className="mt-1 text-xs text-[#71877e]">เลือกซื้อได้แบบกล่อง และแพ็คเมื่อมีราคา</p></div>
+              <SearchInput query={query} onChange={setQuery} categories={productCategories} category={categoryFilter} onCategoryChange={setCategoryFilter} />
+            </div>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+              {matchingProducts.map((product) => {
+                const amount = cart[product.id] || { boxes: 0, packs: 0 };
+                return <RetailerProductCard key={product.id} product={product} boxes={amount.boxes} packs={amount.packs} onChange={changeCart} onSetQuantity={setCartQuantity} />;
+              })}
+            </div>
+            {!matchingProducts.length && <EmptyState icon="⌕" title="ไม่พบสินค้า" text="ลองค้นหาด้วยชื่อสินค้า หรือเลือกประเภทอื่น" />}
+          </section>
+          <RetailerCartPanel cartLines={cartLines} total={cartTotal} onChange={changeCart} onCheckout={checkout} pending={busyAction === "checkout"} retrying={Boolean(pendingCheckoutRequestId)} />
+        </div>
       </div>
     );
   };
@@ -897,7 +977,7 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
           <nav className="space-y-1.5">
             {navItems.map((item) => <NavButton key={item.view} item={item} active={activeView === item.view} onClick={() => setActiveView(item.view)} badge={item.view === "cart" ? cartCount : undefined} />)}
           </nav>
-          {role === "OWNER" && <div className="mt-8 rounded-2xl border border-[#f0dbd0] bg-[#fff8f4] p-4"><p className="text-[11px] font-black text-[#bb5d3c]">ต้องตรวจสอบ</p><p className="mt-1 text-sm font-black text-[#3b5049]">มี {lowStock.length} สินค้าใกล้หมด</p><button onClick={() => { setActiveView("overview"); setQuery(""); }} className="mt-3 text-xs font-extrabold text-[#bd5d3b]">เปิดคลังสินค้า →</button></div>}
+          {role === "OWNER" && <div className="mt-8 rounded-2xl border border-red-200 bg-red-50 p-4"><p className="text-[11px] font-black text-red-700">ต้องตรวจสอบ</p><p className="mt-1 text-sm font-black text-red-900">มี {lowStock.length} สินค้าใกล้หมด</p><button onClick={() => { setActiveView("overview"); setQuery(""); }} className="mt-3 rounded-lg bg-red-600 px-3 py-2 text-xs font-extrabold text-white transition hover:bg-red-700">เปิดคลังสินค้า →</button></div>}
         </aside>
 
         <main className="min-w-0 px-4 py-5 sm:px-6 sm:py-7 lg:px-8">
@@ -929,15 +1009,19 @@ function NavButton({ item, active, onClick, badge, compact = false }: { item: { 
 }
 
 function MetricRow({ metrics }: { metrics: Array<{ label: string; value: string; note: string; glyph: string; tone: string }> }) {
-  return <section className="grid gap-3 sm:grid-cols-3">{metrics.map((metric) => <article key={metric.label} className="rounded-[22px] border border-[#dbe8e2] bg-white p-4 shadow-sm sm:p-5"><div className="flex items-start justify-between"><span className={`grid h-10 w-10 place-items-center rounded-xl text-lg font-black ${metric.tone}`}>{metric.glyph}</span><span className="text-3xl font-black tracking-[-.05em] text-[#173f35]">{metric.value}</span></div><p className="mt-4 text-sm font-black text-[#345b50]">{metric.label}</p><p className="mt-1 text-[11px] font-semibold text-[#778e84]">{metric.note}</p></article>)}</section>;
+  return <section className={`grid gap-3 ${metrics.length > 3 ? "sm:grid-cols-2 xl:grid-cols-4" : "sm:grid-cols-3"}`}>{metrics.map((metric) => <article key={metric.label} className="rounded-[22px] border border-[#dbe8e2] bg-white p-4 shadow-sm sm:p-5"><div className="flex items-start justify-between"><span className={`grid h-10 w-10 place-items-center rounded-xl text-lg font-black ${metric.tone}`}>{metric.glyph}</span><span className="text-3xl font-black tracking-[-.05em] text-[#173f35]">{metric.value}</span></div><p className="mt-4 text-sm font-black text-[#345b50]">{metric.label}</p><p className="mt-1 text-[11px] font-semibold text-[#778e84]">{metric.note}</p></article>)}</section>;
 }
 
-function SearchInput({ query, onChange }: { query: string; onChange: (value: string) => void }) {
-  return <label className="flex min-w-[210px] items-center gap-2 rounded-xl border border-[#d6e5de] bg-[#fbfcfa] px-3 py-2.5 text-[#688075] transition focus-within:border-[#1c8068] focus-within:ring-4 focus-within:ring-[#d8eee5]"><span className="text-base">⌕</span><input value={query} onChange={(event) => onChange(event.target.value)} placeholder="ค้นหาสินค้า" className="min-w-0 flex-1 bg-transparent text-xs font-bold text-[#32544a] outline-none placeholder:text-[#9cafaa]" /></label>;
+function SearchInput({ query, onChange, categories, category, onCategoryChange }: { query: string; onChange: (value: string) => void; categories?: string[]; category?: string; onCategoryChange?: (value: string) => void }) {
+  return <div className="flex flex-wrap items-center gap-2"><label className="flex min-w-[210px] flex-1 items-center gap-2 rounded-xl border border-[#d6e5de] bg-[#fbfcfa] px-3 py-2.5 text-[#688075] transition focus-within:border-[#1c8068] focus-within:ring-4 focus-within:ring-[#d8eee5]"><span className="text-base">⌕</span><input value={query} onChange={(event) => onChange(event.target.value)} placeholder="ค้นหาสินค้า" className="min-w-0 flex-1 bg-transparent text-xs font-bold text-[#32544a] outline-none placeholder:text-[#9cafaa]" /></label>{onCategoryChange && <label className="flex items-center gap-2 rounded-xl border border-[#d6e5de] bg-[#fbfcfa] px-3 py-2.5 text-xs font-bold text-[#45665b] focus-within:border-[#1c8068] focus-within:ring-4 focus-within:ring-[#d8eee5]"><span className="text-[#698177]">ประเภท</span><select aria-label="กรองตามประเภทสินค้า" value={category || ""} onChange={(event) => onCategoryChange(event.target.value)} className="max-w-[150px] bg-transparent text-xs font-extrabold text-[#254b40] outline-none"><option value="">ทุกประเภท</option>{(categories || []).map((item) => <option key={item} value={item}>{item}</option>)}</select></label>}</div>;
 }
 
 function ProductMark({ product, size = "md" }: { product: Product; size?: "sm" | "md" }) {
   return <span className={`grid shrink-0 place-items-center rounded-xl font-black ${size === "sm" ? "h-8 w-8 text-xs" : "h-10 w-10 text-sm"} ${productTone(product.id)}`}>{product.name.slice(0, 1)}</span>;
+}
+
+function TrashIcon() {
+  return <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v5" /><path d="M14 11v5" /></svg>;
 }
 
 function InventoryPanel({ title, caption, products, query, onQueryChange, onAdjust, onDelete, busyAction, owner = false }: { title: string; caption: string; products: Product[]; query: string; onQueryChange: (value: string) => void; onAdjust: (product: Product, delta: number) => void; onDelete?: (product: Product) => void; busyAction: string | null; owner?: boolean }) {
@@ -949,15 +1033,11 @@ function InventoryPanel({ title, caption, products, query, onQueryChange, onAdju
     setQuantities((current) => ({ ...current, [product.id]: "" }));
   };
 
-  return <section className="overflow-hidden rounded-[25px] border border-[#dbe8e2] bg-white shadow-sm"><div className="flex flex-col justify-between gap-3 border-b border-[#edf2ef] p-4 sm:flex-row sm:items-center sm:p-5"><div><h2 className="text-lg font-black tracking-tight text-[#173f35]">{title}</h2><p className="mt-1 text-xs text-[#748a80]">{caption}</p></div><SearchInput query={query} onChange={onQueryChange} /></div><div className="divide-y divide-[#edf2ef]">{products.map((product) => { const stock = stockLabel(product.stock); const busy = busyAction === `stock-${product.id}` || busyAction === `delete-${product.id}`; const quantity = Number(quantities[product.id]); const canAdd = Number.isInteger(quantity) && quantity >= 1 && quantity <= MAX_QUANTITY; return <div key={product.id} className="flex flex-wrap items-center gap-3 p-4 transition hover:bg-[#fbfdfb] sm:flex-nowrap sm:p-4.5"><ProductMark product={product} /><div className="min-w-[145px] flex-1"><p className="truncate text-sm font-black text-[#2a4c42]">{product.name}</p><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className="text-[11px] font-bold text-[#667e74]">กล่อง {price(product.price_box)}</span>{product.price_pack !== null && <><span className="text-[#bdcbc5]">·</span><span className="text-[11px] font-bold text-[#667e74]">แพ็ค {price(product.price_pack)}</span></>}</div></div><div className="ml-auto flex items-center gap-2"><span className={`rounded-lg px-2 py-1 text-[10px] font-black ${stock.className}`}>{stock.text}</span><span className="min-w-8 text-right text-sm font-black text-[#244b40]">{product.stock}</span></div><div className="flex flex-wrap items-center justify-end gap-1.5"><button disabled={busy || product.stock === 0} onClick={() => onAdjust(product, -1)} className="grid h-8 w-8 place-items-center rounded-lg border border-[#d6e5de] text-lg font-bold text-[#4e7064] transition hover:border-[#df9f85] hover:bg-[#fff5f0] hover:text-[#c85d39] disabled:cursor-not-allowed disabled:opacity-40">−</button><button disabled={busy} onClick={() => onAdjust(product, 1)} className="grid h-8 w-8 place-items-center rounded-lg bg-[#e5f3ed] text-lg font-bold text-[#0e715c] transition hover:bg-[#cfeade] disabled:cursor-not-allowed disabled:opacity-40">+</button><input aria-label={`จำนวนที่จะเพิ่มสำหรับ ${product.name}`} value={quantities[product.id] || ""} onChange={(event) => setQuantities((current) => ({ ...current, [product.id]: event.target.value }))} type="number" min="1" max={MAX_QUANTITY} step="1" inputMode="numeric" placeholder="จำนวน" className="h-8 w-20 rounded-lg border border-[#d6e5de] bg-white px-2 text-center text-xs font-bold text-[#244b40] outline-none focus:border-[#1c8068]" /><button disabled={busy || !canAdd} onClick={() => addStock(product)} className="h-8 rounded-lg bg-[#0e4d43] px-2.5 text-xs font-extrabold text-white transition hover:bg-[#0a4038] disabled:cursor-not-allowed disabled:opacity-40">เพิ่ม</button>{owner && onDelete && <button disabled={busy} onClick={() => onDelete(product)} className="ml-1 grid h-8 w-8 place-items-center rounded-lg text-sm text-[#a17466] transition hover:bg-[#fff0ea] hover:text-[#c35130] disabled:opacity-40" aria-label={`ลบ ${product.name}`}>⌫</button>}</div></div>; })}</div>{!products.length && <EmptyState icon="⌕" title="ไม่พบสินค้า" text="ลองค้นหาด้วยคำอื่น หรือเพิ่มสินค้าใหม่" />}</section>;
+  return <section className="overflow-hidden rounded-[25px] border border-[#dbe8e2] bg-white shadow-sm"><div className="flex flex-col justify-between gap-3 border-b border-[#edf2ef] p-4 sm:flex-row sm:items-center sm:p-5"><div><h2 className="text-lg font-black tracking-tight text-[#173f35]">{title}</h2><p className="mt-1 text-xs text-[#748a80]">{caption}</p></div><SearchInput query={query} onChange={onQueryChange} /></div><div className="divide-y divide-[#edf2ef]">{products.map((product) => { const stock = stockLabel(product.stock); const busy = busyAction === `stock-${product.id}` || busyAction === `delete-${product.id}`; const quantity = Number(quantities[product.id]); const canAdd = Number.isInteger(quantity) && quantity >= 1 && quantity <= MAX_QUANTITY; return <div key={product.id} className="flex flex-wrap items-center gap-3 p-4 transition hover:bg-[#fbfdfb] sm:flex-nowrap sm:p-4.5"><ProductMark product={product} /><div className="min-w-[145px] flex-1"><p className="truncate text-sm font-black text-[#2a4c42]">{product.name}</p><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className="rounded-md bg-[#edf5f1] px-1.5 py-0.5 text-[10px] font-black text-[#316756]">{product.category}</span><span className="text-[11px] font-bold text-[#667e74]">กล่อง {price(product.price_box)}</span>{product.price_pack !== null && <><span className="text-[#bdcbc5]">·</span><span className="text-[11px] font-bold text-[#667e74]">แพ็ค {price(product.price_pack)}</span></>}</div></div><div className="ml-auto flex items-center gap-2"><span className={`rounded-lg px-2 py-1 text-[10px] font-black ${stock.className}`}>{stock.text}</span><span className="min-w-8 text-right text-sm font-black text-[#244b40]">{product.stock}</span></div><div className="flex flex-wrap items-center justify-end gap-1.5"><button disabled={busy || product.stock === 0} onClick={() => onAdjust(product, -1)} className="grid h-8 w-8 place-items-center rounded-lg border border-[#d6e5de] text-lg font-bold text-[#4e7064] transition hover:border-[#df9f85] hover:bg-[#fff5f0] hover:text-[#c85d39] disabled:cursor-not-allowed disabled:opacity-40">−</button><button disabled={busy} onClick={() => onAdjust(product, 1)} className="grid h-8 w-8 place-items-center rounded-lg bg-[#e5f3ed] text-lg font-bold text-[#0e715c] transition hover:bg-[#cfeade] disabled:cursor-not-allowed disabled:opacity-40">+</button><input aria-label={`จำนวนที่จะเพิ่มสำหรับ ${product.name}`} value={quantities[product.id] || ""} onChange={(event) => setQuantities((current) => ({ ...current, [product.id]: event.target.value }))} type="number" min="1" max={MAX_QUANTITY} step="1" inputMode="numeric" placeholder="จำนวน" className="h-8 w-20 rounded-lg border border-[#d6e5de] bg-white px-2 text-center text-xs font-bold text-[#244b40] outline-none focus:border-[#1c8068]" /><button disabled={busy || !canAdd} onClick={() => addStock(product)} className="h-8 rounded-lg bg-[#0e4d43] px-2.5 text-xs font-extrabold text-white transition hover:bg-[#0a4038] disabled:cursor-not-allowed disabled:opacity-40">เพิ่ม</button>{owner && onDelete && <button disabled={busy} onClick={() => onDelete(product)} title={`ลบ ${product.name}`} className="ml-1 grid h-8 w-8 place-items-center rounded-lg text-[#a17466] transition hover:bg-[#fff0ea] hover:text-[#c35130] focus:outline-none focus:ring-4 focus:ring-[#f7d8ca] disabled:opacity-40" aria-label={`ลบ ${product.name}`}><TrashIcon /></button>}</div></div>; })}</div>{!products.length && <EmptyState icon="⌕" title="ไม่พบสินค้า" text="ลองค้นหาด้วยคำอื่น หรือเพิ่มสินค้าใหม่" />}</section>;
 }
 
 function QuickActionCard({ title, text, action, glyph, tone, onClick }: { title: string; text: string; action: string; glyph: string; tone: string; onClick: () => void }) {
   return <section className={`rounded-[25px] p-5 text-white shadow-[0_16px_35px_rgba(14,77,67,.18)] ${tone}`}><div className="flex items-start justify-between"><span className="grid h-11 w-11 place-items-center rounded-2xl bg-white/12 text-xl">{glyph}</span><span className="rounded-full bg-[#65d5a2]/20 px-2.5 py-1 text-[10px] font-black text-[#c6f0df]">● LIVE</span></div><h3 className="mt-6 text-xl font-black tracking-tight">{title}</h3><p className="mt-2 max-w-xs text-sm leading-6 text-[#c5e4d9]">{text}</p><button onClick={onClick} className="mt-6 rounded-xl bg-white px-3.5 py-2.5 text-xs font-black text-[#0e4d43] transition hover:bg-[#e6f4ee]">{action} →</button></section>;
-}
-
-function OrderList({ orders, selectedId, onSelect }: { orders: Order[]; selectedId: string | null; onSelect: (id: string) => void }) {
-  return <section className="rounded-[25px] border border-[#dbe8e2] bg-white p-4 shadow-sm sm:p-5"><div className="flex items-center justify-between border-b border-[#edf2ef] pb-4"><div><h2 className="text-lg font-black tracking-tight text-[#173f35]">ใบรวมสินค้า</h2><p className="mt-1 text-xs text-[#748a80]">เลือกเพื่อดูชื่อสินค้า ราคา และยอดรวม</p></div><span className="rounded-xl bg-[#e5f3ed] px-3 py-2 text-xs font-black text-[#0e715c]">{orders.length} ออเดอร์</span></div><div className="mt-4 space-y-2">{orders.map((order) => <OrderSelectRow key={order.id} order={order} selected={order.id === selectedId} onClick={() => onSelect(order.id)} />)}</div>{!orders.length && <EmptyState icon="☷" title="ยังไม่มีรายการสินค้า" text="เมื่อผู้ค้าปลีกยืนยันตะกร้า รายการจะรวมอยู่ที่นี่" />}</section>;
 }
 
 function OrderSelectRow({ order, selected, onClick }: { order: Order; selected: boolean; onClick: () => void }) {
@@ -965,15 +1045,31 @@ function OrderSelectRow({ order, selected, onClick }: { order: Order; selected: 
   return <button onClick={onClick} className={`w-full rounded-2xl border p-3 text-left transition ${selected ? "border-[#aad6c5] bg-[#eaf6f0]" : "border-transparent bg-[#fafcfb] hover:border-[#d7e7df] hover:bg-white"}`}><div className="flex items-center gap-2"><span className={`h-2 w-2 rounded-full ${status.dot}`} /><span className="min-w-0 flex-1 truncate text-sm font-black text-[#2a4e43]">{order.retailer?.shop_name || "ร้านค้าที่ลงทะเบียน"}</span><span className="text-[10px] font-bold text-[#81958e]">{dateTime(order.created_at)}</span></div><div className="mt-2 flex items-center justify-between"><span className={`rounded-md px-2 py-1 text-[10px] font-black ${status.className}`}>{status.label}</span><span className="text-sm font-black text-[#0e594b]">{price(order.total_amount)}</span></div></button>;
 }
 
-function OrderDetail({ order }: { order: Order | null }) {
-  if (!order) return <EmptyState icon="☷" title="เลือกรายการสินค้า" text="แตะคำสั่งซื้อทางซ้ายเพื่อดูรายละเอียด" />;
-  const status = statusMeta[order.status];
-  return <section className="rounded-[25px] border border-[#dbe8e2] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#edf2ef] pb-5"><div><p className="text-[11px] font-black tracking-[.11em] text-[#6d887e]">ORDER SUMMARY</p><h2 className="mt-1 text-xl font-black tracking-tight text-[#173f35]">{order.retailer?.shop_name || "ร้านค้าที่ลงทะเบียน"}</h2><p className="mt-1 text-xs font-medium text-[#7c9289]">รหัสออเดอร์ {order.id.slice(-8).toUpperCase()} · {dateTime(order.created_at)}</p></div><span className={`rounded-xl px-3 py-2 text-xs font-black ${status.className}`}>{status.label}</span></div><div className="mt-3 divide-y divide-[#edf2ef]">{order.items.map((item) => <div key={item.id || item.product_id} className="flex items-center gap-3 py-3"><ProductMark product={item.product || { id: item.product_id, name: "สินค้าที่ลบแล้ว", price_box: item.unit_price_box, price_pack: item.unit_price_pack, stock: 0 }} size="sm" /><div className="min-w-0 flex-1"><p className="truncate text-sm font-black text-[#305449]">{item.product?.name || "สินค้าที่ลบออกจากคลัง"}</p><p className="mt-0.5 text-[11px] font-semibold text-[#7a9087]">{item.quantity_box > 0 && `${item.quantity_box} กล่อง`}{item.quantity_box > 0 && item.quantity_pack > 0 && " · "}{item.quantity_pack > 0 && `${item.quantity_pack} แพ็ค`}</p></div><span className="text-sm font-black text-[#174d40]">{price(item.line_total)}</span></div>)}</div><div className="mt-4 flex items-end justify-between rounded-2xl bg-[#f2f7f4] p-4"><div><p className="text-xs font-bold text-[#688078]">ยอดรวมทั้งหมด</p><p className="mt-1 text-[11px] text-[#81968d]">{order.items.length} รายการสินค้า</p></div><p className="text-2xl font-black tracking-tight text-[#0e594b]">{price(order.total_amount)}</p></div></section>;
+function SalesSummary({ receipts, title, description, compact = false }: { receipts: DailyReceipt[]; title: string; description: string; compact?: boolean }) {
+  const today = thailandDateKey();
+  const todayReceipts = receipts.filter((receipt) => receipt.receipt_date === today);
+  const total = todayReceipts.reduce((sum, receipt) => sum + receipt.total_amount, 0);
+  const units = todayReceipts.reduce((sum, receipt) => sum + receipt.items.reduce((itemSum, item) => itemSum + item.quantity_box + item.quantity_pack, 0), 0);
+
+  return <section className={`rounded-[25px] border border-[#dbe8e2] bg-white shadow-sm ${compact ? "p-4" : "p-5"}`}><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-[11px] font-black tracking-[.11em] text-[#19856c]">DAILY SALES</p><h2 className="mt-1 text-xl font-black tracking-tight text-[#173f35]">{title}</h2><p className="mt-1 text-xs leading-5 text-[#738980]">{description}</p></div><span className="rounded-xl bg-[#e5f3ed] px-3 py-2 text-xs font-black text-[#0e715c]">{receiptDate(today)}</span></div><div className={`mt-4 grid gap-3 ${compact ? "sm:grid-cols-3" : "sm:grid-cols-3"}`}><div className="rounded-2xl bg-[#e5f3ed] p-3"><p className="text-[10px] font-black tracking-[.08em] text-[#4e7366]">ยอดรวมวันนี้</p><p className="mt-1 text-xl font-black tracking-tight text-[#0e5e4f]">{price(total)}</p></div><div className="rounded-2xl bg-[#f3f7f5] p-3"><p className="text-[10px] font-black tracking-[.08em] text-[#607d72]">ใบเสร็จ</p><p className="mt-1 text-xl font-black tracking-tight text-[#244b40]">{todayReceipts.length}</p></div><div className="rounded-2xl bg-[#fff5da] p-3"><p className="text-[10px] font-black tracking-[.08em] text-[#8f711e]">จำนวนหน่วยสินค้า</p><p className="mt-1 text-xl font-black tracking-tight text-[#7a5c12]">{units.toLocaleString()}</p></div></div></section>;
+}
+
+function ReceiptSelectRow({ receipt, selected, onClick }: { receipt: DailyReceipt; selected: boolean; onClick: () => void }) {
+  return <button onClick={onClick} className={`w-full rounded-2xl border p-3 text-left transition ${selected ? "border-[#aad6c5] bg-[#eaf6f0]" : "border-transparent bg-[#fafcfb] hover:border-[#d7e7df] hover:bg-white"}`}><div className="flex items-center gap-2"><span className="grid h-6 w-6 place-items-center rounded-lg bg-[#e5f3ed] text-[11px] font-black text-[#0e715c]">฿</span><span className="min-w-0 flex-1 truncate text-sm font-black text-[#2a4e43]">{receipt.retailer?.shop_name || "ร้านค้าที่ลงทะเบียน"}</span></div><p className="mt-2 text-[11px] font-semibold text-[#81958e]">วันที่สั่งซื้อ {receiptDate(receipt.receipt_date)}</p><div className="mt-2 flex items-center justify-between gap-2"><span className="rounded-md bg-[#edf5f1] px-2 py-1 text-[10px] font-black text-[#276a57]">{receipt.items.length} รายการ</span><span className="text-sm font-black text-[#0e594b]">{price(receipt.total_amount)}</span></div></button>;
+}
+
+function ReceiptList({ receipts, selectedId, onSelect }: { receipts: DailyReceipt[]; selectedId: string | null; onSelect: (id: string) => void }) {
+  return <section className="rounded-[25px] border border-[#dbe8e2] bg-white p-4 shadow-sm sm:p-5"><div className="flex items-center justify-between border-b border-[#edf2ef] pb-4"><div><h2 className="text-lg font-black tracking-tight text-[#173f35]">ใบเสร็จรายวันของร้านค้า</h2><p className="mt-1 text-xs text-[#748a80]">แยกตามร้านค้าและวันที่สั่งซื้อ</p></div><span className="rounded-xl bg-[#e5f3ed] px-3 py-2 text-xs font-black text-[#0e715c]">{receipts.length} ใบเสร็จ</span></div><div className="mt-4 space-y-2">{receipts.map((receipt) => <ReceiptSelectRow key={receipt.id} receipt={receipt} selected={receipt.id === selectedId} onClick={() => onSelect(receipt.id)} />)}</div>{!receipts.length && <EmptyState icon="☷" title="ยังไม่มีใบเสร็จสินค้า" text="เมื่อผู้ค้าปลีกยืนยันตะกร้า ระบบจะสร้างใบเสร็จรายวันให้ที่นี่" />}</section>;
+}
+
+function ReceiptDetail({ receipt }: { receipt: DailyReceipt | null }) {
+  if (!receipt) return <EmptyState icon="☷" title="เลือกใบเสร็จสินค้า" text="แตะใบเสร็จทางซ้ายเพื่อดูรายการสินค้าในวันนั้น" />;
+  return <section className="rounded-[25px] border border-[#dbe8e2] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#edf2ef] pb-5"><div><p className="text-[11px] font-black tracking-[.11em] text-[#6d887e]">DAILY RECEIPT</p><h2 className="mt-1 text-xl font-black tracking-tight text-[#173f35]">{receipt.retailer?.shop_name || "ร้านค้าที่ลงทะเบียน"}</h2><p className="mt-1 text-xs font-medium text-[#7c9289]">วันที่สั่งซื้อ {receiptDate(receipt.receipt_date)} · ใบเสร็จ {receipt.id.slice(-8).toUpperCase()}</p></div><span className="rounded-xl bg-[#e5f3ed] px-3 py-2 text-xs font-black text-[#177253]">บันทึกแล้ว</span></div><div className="mt-3 divide-y divide-[#edf2ef]">{receipt.items.map((item, index) => { const product = item.product || { id: item.product_id || `receipt-${index}`, name: item.product_name, category: item.category || "ทั่วไป", price_box: item.unit_price_box, price_pack: item.unit_price_pack, stock: 0 }; return <div key={item.id || `${item.product_id || item.product_name}-${index}`} className="flex items-center gap-3 py-3"><ProductMark product={product} size="sm" /><div className="min-w-0 flex-1"><p className="truncate text-sm font-black text-[#305449]">{item.product?.name || item.product_name}</p><div className="mt-0.5 flex flex-wrap items-center gap-1.5"><span className="rounded-md bg-[#edf5f1] px-1.5 py-0.5 text-[10px] font-black text-[#316756]">{item.product?.category || item.category || "ทั่วไป"}</span><span className="text-[11px] font-semibold text-[#7a9087]">{item.quantity_box > 0 && `${item.quantity_box} กล่อง`}{item.quantity_box > 0 && item.quantity_pack > 0 && " · "}{item.quantity_pack > 0 && `${item.quantity_pack} แพ็ค`}</span></div></div><span className="text-sm font-black text-[#174d40]">{price(item.line_total)}</span></div>; })}</div><div className="mt-4 flex items-end justify-between rounded-2xl bg-[#f2f7f4] p-4"><div><p className="text-xs font-bold text-[#688078]">ยอดรวมในใบเสร็จ</p><p className="mt-1 text-[11px] text-[#81968d]">{receipt.items.length} รายการสินค้า · วันที่สั่งซื้อ {receiptDate(receipt.receipt_date)}</p></div><p className="text-2xl font-black tracking-tight text-[#0e594b]">{price(receipt.total_amount)}</p></div></section>;
 }
 
 function ProductForm({ draft, onChange, onSubmit, pending }: { draft: ProductDraft; onChange: (value: ProductDraft) => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void; pending: boolean }) {
   const update = (key: keyof ProductDraft, value: string) => onChange({ ...draft, [key]: value });
-  return <section className="mx-auto max-w-3xl rounded-[27px] border border-[#dbe8e2] bg-white p-5 shadow-sm sm:p-7"><div className="flex items-start gap-4 border-b border-[#edf2ef] pb-5"><span className="grid h-11 w-11 place-items-center rounded-2xl bg-[#fff0e9] text-2xl font-black text-[#c45c37]">+</span><div><h2 className="text-xl font-black tracking-tight text-[#173f35]">เพิ่มสินค้าใหม่</h2><p className="mt-1 text-sm leading-6 text-[#72877f]">ราคากล่องเป็นข้อมูลบังคับ ส่วนราคาแพ็คสามารถเว้นว่างได้</p></div></div><form onSubmit={onSubmit} className="mt-6 grid gap-4 sm:grid-cols-2"><Field label="ชื่อสินค้า" required className="sm:col-span-2"><input value={draft.name} onChange={(event) => update("name", event.target.value)} placeholder="เช่น น้ำยาล้างจาน 500 มล." className={inputClass} required /></Field><Field label="ราคากล่อง (บาท)" required><input value={draft.priceBox} onChange={(event) => update("priceBox", event.target.value)} type="number" min="0" step="0.01" placeholder="0.00" className={inputClass} required /></Field><Field label="ราคาแพ็ค (บาท)" hint="ไม่บังคับ"><input value={draft.pricePack} onChange={(event) => update("pricePack", event.target.value)} type="number" min="0" step="0.01" placeholder="เว้นว่างได้" className={inputClass} /></Field><Field label="จำนวนเริ่มต้นในคลัง"><input value={draft.stock} onChange={(event) => update("stock", event.target.value)} type="number" min="0" step="1" placeholder="0" className={inputClass} /></Field><div className="hidden sm:block" /><div className="sm:col-span-2 flex flex-col-reverse gap-3 border-t border-[#edf2ef] pt-5 sm:flex-row sm:justify-end"><button type="button" onClick={() => onChange(createEmptyDraft())} className="rounded-xl px-4 py-3 text-sm font-extrabold text-[#658077] transition hover:bg-[#f3f7f5]">ล้างข้อมูล</button><button disabled={pending} type="submit" className="rounded-xl bg-[#f27d52] px-5 py-3 text-sm font-extrabold text-white shadow-[0_10px_20px_rgba(242,125,82,.22)] transition hover:bg-[#e86d43] disabled:opacity-60">{pending ? "กำลังบันทึก..." : "บันทึกสินค้าเข้าคลัง"} →</button></div></form></section>;
+  return <section className="mx-auto max-w-3xl rounded-[27px] border border-[#dbe8e2] bg-white p-5 shadow-sm sm:p-7"><div className="flex items-start gap-4 border-b border-[#edf2ef] pb-5"><span className="grid h-11 w-11 place-items-center rounded-2xl bg-[#fff0e9] text-2xl font-black text-[#c45c37]">+</span><div><h2 className="text-xl font-black tracking-tight text-[#173f35]">เพิ่มสินค้าใหม่</h2><p className="mt-1 text-sm leading-6 text-[#72877f]">ระบุประเภทสินค้าเพื่อให้ผู้ค้าปลีกค้นหาและกรองสินค้าได้สะดวก</p></div></div><form onSubmit={onSubmit} className="mt-6 grid gap-4 sm:grid-cols-2"><Field label="ชื่อสินค้า" required><input value={draft.name} onChange={(event) => update("name", event.target.value)} placeholder="เช่น น้ำยาล้างจาน 500 มล." className={inputClass} required /></Field><Field label="ประเภทสินค้า" required><input value={draft.category} onChange={(event) => update("category", event.target.value)} list="product-category-options" maxLength={80} placeholder="เช่น ของใช้ในบ้าน" className={inputClass} required /><datalist id="product-category-options"><option value="ทั่วไป" /><option value="อาหารและเครื่องดื่ม" /><option value="ของใช้ในบ้าน" /><option value="ของใช้ส่วนตัว" /><option value="อุปกรณ์สำนักงาน" /></datalist></Field><Field label="ราคากล่อง (บาท)" required><input value={draft.priceBox} onChange={(event) => update("priceBox", event.target.value)} type="number" min="0" step="0.01" placeholder="0.00" className={inputClass} required /></Field><Field label="ราคาแพ็ค (บาท)" hint="ไม่บังคับ"><input value={draft.pricePack} onChange={(event) => update("pricePack", event.target.value)} type="number" min="0" step="0.01" placeholder="เว้นว่างได้" className={inputClass} /></Field><Field label="จำนวนเริ่มต้นในคลัง"><input value={draft.stock} onChange={(event) => update("stock", event.target.value)} type="number" min="0" step="1" placeholder="0" className={inputClass} /></Field><div className="hidden sm:block" /><div className="sm:col-span-2 flex flex-col-reverse gap-3 border-t border-[#edf2ef] pt-5 sm:flex-row sm:justify-end"><button type="button" onClick={() => onChange(createEmptyDraft())} className="rounded-xl px-4 py-3 text-sm font-extrabold text-[#658077] transition hover:bg-[#f3f7f5]">ล้างข้อมูล</button><button disabled={pending} type="submit" className="rounded-xl bg-[#f27d52] px-5 py-3 text-sm font-extrabold text-white shadow-[0_10px_20px_rgba(242,125,82,.22)] transition hover:bg-[#e86d43] disabled:opacity-60">{pending ? "กำลังบันทึก..." : "บันทึกสินค้าเข้าคลัง"} →</button></div></form></section>;
 }
 
 const inputClass = "w-full rounded-xl border border-[#d4e3dc] bg-[#fbfcfa] px-3.5 py-3 text-sm font-semibold text-[#264c41] outline-none transition placeholder:text-[#a9bbb4] focus:border-[#1f8168] focus:ring-4 focus:ring-[#d8eee5]";
@@ -984,50 +1080,19 @@ function Field({ label, hint, required, children, className = "" }: { label: str
 
 function RetailerProductCard({ product, boxes, packs, onChange, onSetQuantity }: { product: Product; boxes: number; packs: number; onChange: (product: Product, unit: "boxes" | "packs", delta: number) => void; onSetQuantity: (product: Product, unit: "boxes" | "packs", value: number) => void }) {
   const stock = stockLabel(product.stock);
-  return <article className="rounded-2xl border border-[#e0ebe5] bg-[#fcfdfc] p-4 transition hover:-translate-y-0.5 hover:border-[#b9dace] hover:shadow-[0_10px_22px_rgba(17,70,58,.07)]"><div className="flex items-start gap-3"><ProductMark product={product} /><div className="min-w-0 flex-1"><p className="min-h-10 text-sm font-black leading-5 text-[#254a40]">{product.name}</p><span className={`mt-2 inline-block rounded-md px-2 py-1 text-[10px] font-black ${stock.className}`}>เหลือ {product.stock}</span></div></div><div className="mt-4 rounded-xl bg-[#f1f6f3] p-3"><PriceStepper label="กล่อง" value={boxes} valueLabel={price(product.price_box)} onDecrease={() => onChange(product, "boxes", -1)} onIncrease={() => onChange(product, "boxes", 1)} onSetValue={(value) => onSetQuantity(product, "boxes", value)} /><div className="my-2 border-t border-[#dce8e2]" />{product.price_pack !== null ? <PriceStepper label="แพ็ค" value={packs} valueLabel={price(product.price_pack)} onDecrease={() => onChange(product, "packs", -1)} onIncrease={() => onChange(product, "packs", 1)} onSetValue={(value) => onSetQuantity(product, "packs", value)} /> : <div className="flex items-center justify-between text-[11px] font-semibold text-[#8a9d95]"><span>แพ็ค</span><span>ไม่มีราคาต่อแพ็ค</span></div>}</div></article>;
+  return <article className="rounded-2xl border border-[#e0ebe5] bg-[#fcfdfc] p-4 transition hover:-translate-y-0.5 hover:border-[#b9dace] hover:shadow-[0_10px_22px_rgba(17,70,58,.07)]"><div className="flex items-start gap-3"><ProductMark product={product} /><div className="min-w-0 flex-1"><p className="min-h-10 text-sm font-black leading-5 text-[#254a40]">{product.name}</p><div className="mt-2 flex flex-wrap items-center gap-1.5"><span className="rounded-md bg-[#edf5f1] px-2 py-1 text-[10px] font-black text-[#316756]">{product.category}</span><span className={`rounded-md px-2 py-1 text-[10px] font-black ${stock.className}`}>เหลือ {product.stock}</span></div></div></div><div className="mt-4 rounded-xl bg-[#f1f6f3] p-3"><PriceStepper label="กล่อง" value={boxes} valueLabel={price(product.price_box)} onDecrease={() => onChange(product, "boxes", -1)} onIncrease={() => onChange(product, "boxes", 1)} onSetValue={(value) => onSetQuantity(product, "boxes", value)} /><div className="my-2 border-t border-[#dce8e2]" />{product.price_pack !== null ? <PriceStepper label="แพ็ค" value={packs} valueLabel={price(product.price_pack)} onDecrease={() => onChange(product, "packs", -1)} onIncrease={() => onChange(product, "packs", 1)} onSetValue={(value) => onSetQuantity(product, "packs", value)} /> : <div className="flex items-center justify-between text-[11px] font-semibold text-[#8a9d95]"><span>แพ็ค</span><span>ไม่มีราคาต่อแพ็ค</span></div>}</div></article>;
 }
 
 function PriceStepper({ label, value, valueLabel, onDecrease, onIncrease, onSetValue }: { label: string; value: number; valueLabel: string; onDecrease: () => void; onIncrease: () => void; onSetValue: (value: number) => void }) {
   return <div className="flex items-center gap-2"><div className="min-w-0 flex-1"><p className="text-[11px] font-black text-[#42665a]">{label}</p><p className="mt-0.5 text-xs font-black text-[#0e6957]">{valueLabel}</p></div><button disabled={value === 0} onClick={onDecrease} className="grid h-7 w-7 place-items-center rounded-lg bg-white text-base font-bold text-[#55776c] shadow-sm transition hover:bg-[#fff0ea] hover:text-[#c45c37] disabled:opacity-35">−</button><input aria-label={`จำนวน${label}`} value={value} onChange={(event) => onSetValue(Number(event.target.value))} type="number" min="0" max={MAX_QUANTITY} step="1" inputMode="numeric" className="h-7 w-12 rounded-lg border border-[#d6e5de] bg-white px-1 text-center text-sm font-black text-[#214b40] outline-none focus:border-[#1c8068]" /><button onClick={onIncrease} className="grid h-7 w-7 place-items-center rounded-lg bg-[#0e4d43] text-base font-bold text-white shadow-sm transition hover:bg-[#0a4038]">+</button></div>;
 }
 
-function RetailerCartPanel({ cartLines, total, onChange, onCheckout, pending, standalone = false }: { cartLines: CartLine[]; total: number; onChange: (product: Product, unit: "boxes" | "packs", delta: number) => void; onCheckout: () => void; pending: boolean; standalone?: boolean }) {
-  return <aside className={`${standalone ? "mx-auto max-w-3xl" : "2xl:sticky 2xl:top-[92px] 2xl:self-start"} rounded-[25px] border border-[#dbe8e2] bg-white p-5 shadow-sm`}><div className="flex items-center justify-between border-b border-[#edf2ef] pb-4"><div><h2 className="text-lg font-black tracking-tight text-[#173f35]">ตะกร้าสินค้าของฉัน</h2><p className="mt-1 text-xs text-[#738980]">{cartLines.length ? `${cartLines.length} รายการสินค้า` : "ยังไม่มีสินค้าในตะกร้า"}</p></div><span className="grid h-10 w-10 place-items-center rounded-xl bg-[#fff0e9] text-lg text-[#c55d3a]">☷</span></div>{standalone && <p className="mt-3 rounded-xl bg-[#f3f7f5] px-3 py-2 text-[11px] font-semibold leading-5 text-[#617b70]">รายการที่เพิ่มจะถูกจำไว้ในเบราว์เซอร์ของร้านนี้ แม้รีเฟรชหน้าเว็บ</p>}{cartLines.length ? <div className="mt-3 divide-y divide-[#edf2ef]">{cartLines.map((line) => <div key={line.product.id} className="py-3"><div className="flex items-center gap-2"><ProductMark product={line.product} size="sm" /><p className="min-w-0 flex-1 truncate text-xs font-black text-[#305449]">{line.product.name}</p><span className="text-xs font-black text-[#0e5e4f]">{price(line.boxes * line.product.price_box + line.packs * (line.product.price_pack || 0))}</span></div><div className="mt-2 ml-11 flex flex-wrap gap-2"><span className="inline-flex items-center gap-1 rounded-lg bg-[#f3f7f5] px-1 py-1 text-[10px] font-bold text-[#617b70]"><button onClick={() => onChange(line.product, "boxes", -1)} className="grid h-5 w-5 place-items-center rounded bg-white text-sm text-[#486b5e] shadow-sm">−</button>{line.boxes} กล่อง<button onClick={() => onChange(line.product, "boxes", 1)} className="grid h-5 w-5 place-items-center rounded bg-[#0e4d43] text-sm text-white shadow-sm">+</button></span>{line.product.price_pack !== null && <span className="inline-flex items-center gap-1 rounded-lg bg-[#f3f7f5] px-1 py-1 text-[10px] font-bold text-[#617b70]"><button onClick={() => onChange(line.product, "packs", -1)} className="grid h-5 w-5 place-items-center rounded bg-white text-sm text-[#486b5e] shadow-sm">−</button>{line.packs} แพ็ค<button onClick={() => onChange(line.product, "packs", 1)} className="grid h-5 w-5 place-items-center rounded bg-[#0e4d43] text-sm text-white shadow-sm">+</button></span>}</div></div>)}</div> : <div className="py-12 text-center"><span className="grid mx-auto h-12 w-12 place-items-center rounded-2xl bg-[#f1f6f3] text-xl text-[#88a096]">☷</span><p className="mt-3 text-sm font-black text-[#557268]">ตะกร้ายังว่าง</p><p className="mt-1 text-xs leading-5 text-[#83978f]">เลือกสินค้าและระบุจำนวนที่ต้องการ</p></div>}<div className="mt-4 rounded-2xl bg-[#e5f3ed] p-4"><div className="flex items-end justify-between"><div><p className="text-xs font-bold text-[#5d786d]">ยอดรวมทั้งหมด</p><p className="mt-1 text-[11px] text-[#769087]">รวมราคากล่องและแพ็ค</p></div><p className="text-2xl font-black tracking-tight text-[#0e5e4f]">{price(total)}</p></div></div><button disabled={!cartLines.length || pending} onClick={onCheckout} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-[#f27d52] py-3.5 text-sm font-extrabold text-white shadow-[0_10px_20px_rgba(242,125,82,.2)] transition hover:bg-[#e86d43] disabled:cursor-not-allowed disabled:opacity-45">{pending ? "กำลังยืนยัน..." : "ยืนยันการสั่งซื้อสินค้า"} <span>→</span></button></aside>;
+function RetailerCartPanel({ cartLines, total, onChange, onCheckout, pending, retrying, standalone = false }: { cartLines: CartLine[]; total: number; onChange: (product: Product, unit: "boxes" | "packs", delta: number) => void; onCheckout: () => void; pending: boolean; retrying: boolean; standalone?: boolean }) {
+  return <aside className={`${standalone ? "mx-auto max-w-3xl" : "2xl:sticky 2xl:top-[92px] 2xl:self-start"} rounded-[25px] border border-[#dbe8e2] bg-white p-5 shadow-sm`}><div className="flex items-center justify-between border-b border-[#edf2ef] pb-4"><div><h2 className="text-lg font-black tracking-tight text-[#173f35]">ตะกร้าสินค้าของฉัน</h2><p className="mt-1 text-xs text-[#738980]">{cartLines.length ? `${cartLines.length} รายการสินค้า` : "ยังไม่มีสินค้าในตะกร้า"}</p></div><span className="grid h-10 w-10 place-items-center rounded-xl bg-[#fff0e9] text-lg text-[#c55d3a]">☷</span></div>{standalone && <p className="mt-3 rounded-xl bg-[#f3f7f5] px-3 py-2 text-[11px] font-semibold leading-5 text-[#617b70]">รายการที่เพิ่มจะถูกจำไว้ในเบราว์เซอร์ของร้านนี้ และเมื่อยืนยันแล้ว ระบบจะรวมเข้ากับใบเสร็จของวันนี้อัตโนมัติ</p>}{retrying && !pending && <p className="mt-3 rounded-xl bg-[#fff5da] px-3 py-2 text-[11px] font-semibold leading-5 text-[#80651b]">กำลังตรวจสอบผลการยืนยันครั้งก่อน เพื่อป้องกันรายการและสต๊อกซ้ำ กรุณากดยืนยันอีกครั้งก่อนแก้ไขตะกร้า</p>}{cartLines.length ? <div className="mt-3 divide-y divide-[#edf2ef]">{cartLines.map((line) => <div key={line.product.id} className="py-3"><div className="flex items-center gap-2"><ProductMark product={line.product} size="sm" /><p className="min-w-0 flex-1 truncate text-xs font-black text-[#305449]">{line.product.name}</p><span className="text-xs font-black text-[#0e5e4f]">{price(line.boxes * line.product.price_box + line.packs * (line.product.price_pack || 0))}</span></div><div className="mt-2 ml-11 flex flex-wrap gap-2"><span className="inline-flex items-center gap-1 rounded-lg bg-[#f3f7f5] px-1 py-1 text-[10px] font-bold text-[#617b70]"><button disabled={retrying} onClick={() => onChange(line.product, "boxes", -1)} className="grid h-5 w-5 place-items-center rounded bg-white text-sm text-[#486b5e] shadow-sm disabled:opacity-40">−</button>{line.boxes} กล่อง<button disabled={retrying} onClick={() => onChange(line.product, "boxes", 1)} className="grid h-5 w-5 place-items-center rounded bg-[#0e4d43] text-sm text-white shadow-sm disabled:opacity-40">+</button></span>{line.product.price_pack !== null && <span className="inline-flex items-center gap-1 rounded-lg bg-[#f3f7f5] px-1 py-1 text-[10px] font-bold text-[#617b70]"><button disabled={retrying} onClick={() => onChange(line.product, "packs", -1)} className="grid h-5 w-5 place-items-center rounded bg-white text-sm text-[#486b5e] shadow-sm disabled:opacity-40">−</button>{line.packs} แพ็ค<button disabled={retrying} onClick={() => onChange(line.product, "packs", 1)} className="grid h-5 w-5 place-items-center rounded bg-[#0e4d43] text-sm text-white shadow-sm disabled:opacity-40">+</button></span>}</div></div>)}</div> : <div className="py-12 text-center"><span className="grid mx-auto h-12 w-12 place-items-center rounded-2xl bg-[#f1f6f3] text-xl text-[#88a096]">☷</span><p className="mt-3 text-sm font-black text-[#557268]">ตะกร้ายังว่าง</p><p className="mt-1 text-xs leading-5 text-[#83978f]">เลือกสินค้าและระบุจำนวนที่ต้องการ</p></div>}<div className="mt-4 rounded-2xl bg-[#e5f3ed] p-4"><div className="flex items-end justify-between"><div><p className="text-xs font-bold text-[#5d786d]">ยอดรวมทั้งหมด</p><p className="mt-1 text-[11px] text-[#769087]">รวมราคากล่องและแพ็ค</p></div><p className="text-2xl font-black tracking-tight text-[#0e5e4f]">{price(total)}</p></div></div><button disabled={!cartLines.length || pending} onClick={onCheckout} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-[#f27d52] py-3.5 text-sm font-extrabold text-white shadow-[0_10px_20px_rgba(242,125,82,.2)] transition hover:bg-[#e86d43] disabled:cursor-not-allowed disabled:opacity-45">{pending ? "กำลังยืนยัน..." : retrying ? "ยืนยันซ้ำเพื่อตรวจสอบผล" : "ยืนยันและตัดสต๊อกสินค้า"} <span>→</span></button></aside>;
 }
 
-function RetailerOrderHistory({ orders, selectedOrder, onSelect }: { orders: Order[]; selectedOrder: Order | null; onSelect: (id: string) => void }) {
-  return (
-    <section className="mx-auto max-w-5xl rounded-[25px] border border-[#dbe8e2] bg-white p-5 shadow-sm">
-      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#edf2ef] pb-4">
-        <div>
-          <h2 className="text-lg font-black tracking-tight text-[#173f35]">คำสั่งซื้อที่บันทึกแล้ว</h2>
-          <p className="mt-1 text-xs text-[#738980]">ดูรายการสินค้า ราคา ยอดรวม และสถานะการจัดส่งได้ทุกครั้ง</p>
-        </div>
-        <span className="rounded-xl bg-[#e5f3ed] px-3 py-2 text-xs font-black text-[#0e715c]">{orders.length} ออเดอร์</span>
-      </div>
-
-      {orders.length ? (
-        <div className="mt-4 grid gap-4 xl:grid-cols-[310px_minmax(0,1fr)]">
-          <div className="space-y-2 rounded-2xl bg-[#f7faf8] p-3">
-            {orders.map((order) => {
-              const status = statusMeta[order.status];
-              const selected = order.id === selectedOrder?.id;
-              return (
-                <button key={order.id} onClick={() => onSelect(order.id)} className={`w-full rounded-xl border p-3 text-left transition ${selected ? "border-[#aad6c5] bg-[#eaf6f0]" : "border-transparent bg-white hover:border-[#d7e7df]"}`}>
-                  <div className="flex items-center gap-2"><span className={`h-2 w-2 rounded-full ${status.dot}`} /><span className="min-w-0 flex-1 truncate text-xs font-black text-[#2a4e43]">ออเดอร์ {order.id.slice(-8).toUpperCase()}</span></div>
-                  <p className="mt-1 text-[11px] font-semibold text-[#81958e]">{dateTime(order.created_at)}</p>
-                  <div className="mt-2 flex items-center justify-between gap-2"><span className={`rounded-md px-2 py-1 text-[10px] font-black ${status.className}`}>{status.label}</span><span className="text-sm font-black text-[#0e594b]">{price(order.total_amount)}</span></div>
-                </button>
-              );
-            })}
-          </div>
-          <OrderDetail order={selectedOrder} />
-        </div>
-      ) : (
-        <EmptyState icon="☷" title="ยังไม่มีคำสั่งซื้อที่ยืนยันแล้ว" text="เลือกสินค้าใส่ตะกร้า แล้วกดยืนยันการสั่งซื้อเพื่อเก็บรายการไว้ที่นี่" />
-      )}
-    </section>
-  );
+function RetailerReceiptHistory({ receipts, selectedReceipt, onSelect }: { receipts: DailyReceipt[]; selectedReceipt: DailyReceipt | null; onSelect: (id: string) => void }) {
+  return <section className="mx-auto max-w-5xl rounded-[25px] border border-[#dbe8e2] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#edf2ef] pb-4"><div><h2 className="text-lg font-black tracking-tight text-[#173f35]">ใบเสร็จสินค้ารายวัน</h2><p className="mt-1 text-xs text-[#738980]">รายการที่ยืนยันภายในวันเดียวกันของร้านคุณจะถูกรวมไว้ในใบเสร็จเดียว</p></div><span className="rounded-xl bg-[#e5f3ed] px-3 py-2 text-xs font-black text-[#0e715c]">{receipts.length} ใบเสร็จ</span></div>{receipts.length ? <div className="mt-4 grid gap-4 xl:grid-cols-[310px_minmax(0,1fr)]"><div className="space-y-2 rounded-2xl bg-[#f7faf8] p-3">{receipts.map((receipt) => <ReceiptSelectRow key={receipt.id} receipt={receipt} selected={receipt.id === selectedReceipt?.id} onClick={() => onSelect(receipt.id)} />)}</div><ReceiptDetail receipt={selectedReceipt} /></div> : <EmptyState icon="☷" title="ยังไม่มีใบเสร็จที่ยืนยันแล้ว" text="เลือกสินค้าใส่ตะกร้า แล้วกดยืนยันเพื่อเก็บรวมไว้ในใบเสร็จของวันนี้" />}</section>;
 }
 
 function EmployeeOrderManagement({ order, busyAction, onStatus, onShareLocation }: { order: Order | null; busyAction: string | null; onStatus: (order: Order, status: OrderStatus) => void; onShareLocation: (order: Order) => void }) {

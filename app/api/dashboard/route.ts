@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerAuth } from "@/lib/server-auth";
 import { adminRequest } from "@/lib/server-db";
-import type { DashboardSnapshot, DeliveryTracking, Order, Product, Retailer } from "@/lib/types";
+import type { DailyReceipt, DashboardSnapshot, DeliveryTracking, Order, Product, Retailer } from "@/lib/types";
 
 type RawOrder = Omit<Order, "retailer" | "items" | "tracking"> & {
   retailer?: Retailer | Retailer[] | null;
@@ -10,6 +10,11 @@ type RawOrder = Omit<Order, "retailer" | "items" | "tracking"> & {
 
 type RawTracking = Omit<DeliveryTracking, "employee"> & {
   employee?: NonNullable<DeliveryTracking["employee"]> | NonNullable<DeliveryTracking["employee"]>[] | null;
+};
+
+type RawReceipt = Omit<DailyReceipt, "retailer" | "items"> & {
+  retailer?: Retailer | Retailer[] | null;
+  items?: DailyReceipt["items"];
 };
 
 function one<T>(value: T | T[] | null | undefined): T | null {
@@ -25,6 +30,14 @@ function normalizeOrders(orders: RawOrder[], tracking: DeliveryTracking[]): Orde
   }));
 }
 
+function normalizeReceipts(receipts: RawReceipt[]): DailyReceipt[] {
+  return receipts.map((receipt) => ({
+    ...receipt,
+    retailer: one(receipt.retailer),
+    items: receipt.items || [],
+  }));
+}
+
 export async function GET() {
   const auth = await getServerAuth();
   if (!auth) {
@@ -32,25 +45,35 @@ export async function GET() {
   }
 
   try {
-    const productQuery = "/rest/v1/products?select=id,name,price_box,price_pack,stock,created_at&order=stock.asc";
+    const productQuery = "/rest/v1/products?select=id,name,category,price_box,price_pack,stock,created_at&order=stock.asc";
     const orderQuery =
-      "/rest/v1/orders?select=id,retailer_id,assigned_employee_id,status,total_amount,created_at," +
+      "/rest/v1/orders?select=id,retailer_id,receipt_id,assigned_employee_id,status,total_amount,created_at," +
       "retailer:profiles!orders_retailer_id_fkey(id,shop_name,phone,role)," +
-      "items:order_items(id,product_id,quantity_box,quantity_pack,unit_price_box,unit_price_pack,line_total," +
-      "product:products(id,name,price_box,price_pack,stock))&order=created_at.desc";
+      "items:order_items(id,product_id,product_name,quantity_box,quantity_pack,unit_price_box,unit_price_pack,line_total," +
+      "product:products(id,name,category,price_box,price_pack,stock))&order=created_at.desc";
+    const receiptQuery =
+      "/rest/v1/daily_receipts?select=id,retailer_id,receipt_date,total_amount,created_at,updated_at," +
+      "retailer:profiles!daily_receipts_retailer_id_fkey(id,shop_name,phone,role)," +
+      "items:receipt_items(id,product_id,product_name,category,quantity_box,quantity_pack,unit_price_box,unit_price_pack,line_total," +
+      "product:products(id,name,category,price_box,price_pack,stock))&order=receipt_date.desc,created_at.desc";
     const trackingQuery =
       "/rest/v1/delivery_tracking?select=order_id,employee_id,latitude,longitude,updated_at," +
       "employee:profiles!delivery_tracking_employee_id_fkey(id,shop_name)";
     const retailerQuery = "/rest/v1/profiles?select=id,shop_name,phone,role&role=eq.RETAILER&order=created_at.desc";
 
     const canViewOrders = auth.profile.role === "OWNER" || auth.profile.role === "EMPLOYEE" || auth.profile.role === "RETAILER";
+    const canViewReceipts = auth.profile.role === "OWNER" || auth.profile.role === "RETAILER";
     const filteredOrderQuery = auth.profile.role === "RETAILER"
       ? `${orderQuery}&retailer_id=eq.${encodeURIComponent(auth.user.id)}`
       : orderQuery;
+    const filteredReceiptQuery = auth.profile.role === "RETAILER"
+      ? `${receiptQuery}&retailer_id=eq.${encodeURIComponent(auth.user.id)}`
+      : receiptQuery;
 
-    const [products, rawOrders, rawTracking, retailers] = await Promise.all([
+    const [products, rawOrders, rawReceipts, rawTracking, retailers] = await Promise.all([
       adminRequest<Product[]>(productQuery),
       canViewOrders ? adminRequest<RawOrder[]>(filteredOrderQuery) : Promise.resolve([] as RawOrder[]),
+      canViewReceipts ? adminRequest<RawReceipt[]>(filteredReceiptQuery) : Promise.resolve([] as RawReceipt[]),
       canViewOrders ? adminRequest<RawTracking[]>(trackingQuery) : Promise.resolve([] as RawTracking[]),
       auth.profile.role === "EMPLOYEE" ? adminRequest<Retailer[]>(retailerQuery) : Promise.resolve([] as Retailer[]),
     ]);
@@ -62,6 +85,7 @@ export async function GET() {
     const snapshot: DashboardSnapshot = {
       products: [...products].sort((left, right) => left.stock - right.stock),
       orders: normalizeOrders(rawOrders, tracking),
+      receipts: normalizeReceipts(rawReceipts),
       retailers,
       tracking,
     };

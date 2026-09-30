@@ -14,19 +14,20 @@ export async function POST(request: Request) {
   if (!auth) return NextResponse.json({ message: "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่" }, { status: 401 });
   if (!isOwner(auth.profile.role)) return NextResponse.json({ message: "เฉพาะ OWNER เท่านั้นที่เพิ่มสินค้าได้" }, { status: 403 });
 
-  let input: { name?: unknown; price_box?: unknown; price_pack?: unknown; stock?: unknown };
+  let input: { name?: unknown; category?: unknown; price_box?: unknown; price_pack?: unknown; stock?: unknown };
   try {
-    input = (await request.json()) as { name?: unknown; price_box?: unknown; price_pack?: unknown; stock?: unknown };
+    input = (await request.json()) as { name?: unknown; category?: unknown; price_box?: unknown; price_pack?: unknown; stock?: unknown };
   } catch {
     return NextResponse.json({ message: "รูปแบบข้อมูลไม่ถูกต้อง" }, { status: 400 });
   }
 
   const name = typeof input.name === "string" ? input.name.trim() : "";
+  const category = typeof input.category === "string" ? input.category.trim() : "";
   const priceBox = input.price_box;
   const pricePack = input.price_pack;
   const stock = input.stock;
   if (
-    !name || name.length > 160 ||
+    !name || name.length > 160 || !category || category.length > 80 ||
     typeof priceBox !== "number" || !Number.isFinite(priceBox) || priceBox < 0 ||
     (pricePack !== null && (typeof pricePack !== "number" || !Number.isFinite(pricePack) || pricePack < 0)) ||
     typeof stock !== "number" || !Number.isInteger(stock) || stock < 0
@@ -38,7 +39,7 @@ export async function POST(request: Request) {
     const rows = await adminRequest<Product[]>("/rest/v1/products", {
       method: "POST",
       headers: { Prefer: "return=representation" },
-      body: JSON.stringify({ name, price_box: priceBox, price_pack: pricePack, stock, created_by: auth.user.id }),
+      body: JSON.stringify({ name, category, price_box: priceBox, price_pack: pricePack, stock, created_by: auth.user.id }),
     });
     if (!rows[0]) throw new Error("ไม่สามารถเพิ่มสินค้าได้");
     return NextResponse.json(rows[0], { status: 201 });

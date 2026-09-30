@@ -79,7 +79,7 @@ export async function fetchDashboardSnapshot(
 
 export async function addProduct(
   _session: AppSession,
-  product: Pick<Product, "name" | "price_box" | "price_pack" | "stock">,
+  product: Pick<Product, "name" | "category" | "price_box" | "price_pack" | "stock">,
 ) {
   return apiRequest<Product>("/api/products", {
     method: "POST",
@@ -103,12 +103,13 @@ export async function adjustStock(_session: AppSession, productId: string, delta
 export async function createRetailerOrder(
   _session: AppSession,
   items: Array<{ product_id: string; quantity_box: number; quantity_pack: number }>,
+  requestId: string,
 ) {
-  const payload = await apiRequest<{ orderId: string }>("/api/orders", {
+  const payload = await apiRequest<{ orderId: string; receiptId: string }>("/api/orders", {
     method: "POST",
-    body: JSON.stringify({ items }),
+    body: JSON.stringify({ items, requestId }),
   });
-  return payload.orderId;
+  return payload;
 }
 
 export async function updateDeliveryStatus(
