@@ -1,5 +1,6 @@
 -- 123พาณิชย์ปลีกส่ง · Supabase schema (ฐานข้อมูลเริ่มต้น)
--- หลังรันไฟล์นี้ ต้องรัน custom-auth-migration.sql และ migrations/20260906_daily_receipts_categories_checkout_stock.sql ต่อเสมอ
+-- หลังรันไฟล์นี้ ต้องรัน custom-auth-migration.sql, migrations/20260906_daily_receipts_categories_checkout_stock.sql
+-- และ migrations/20260930_product_category_management.sql ต่อเสมอ
 
 create extension if not exists "pgcrypto";
 
@@ -21,10 +22,22 @@ create table if not exists public.profiles (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.product_categories (
+  id uuid primary key default gen_random_uuid(),
+  name text not null check (char_length(trim(name)) between 1 and 80),
+  normalized_name text not null check (normalized_name = lower(regexp_replace(trim(name), '\s+', ' ', 'g'))),
+  is_active boolean not null default true,
+  created_by uuid references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint product_categories_normalized_name_key unique (normalized_name)
+);
+
 create table if not exists public.products (
   id uuid primary key default gen_random_uuid(),
   name text not null check (char_length(trim(name)) > 0),
   category text not null default 'ทั่วไป' check (char_length(trim(category)) between 1 and 80),
+  category_id uuid references public.product_categories(id) on delete restrict,
   price_box numeric(12, 2) not null check (price_box >= 0),
   price_pack numeric(12, 2) check (price_pack is null or price_pack >= 0),
   stock integer not null default 0 check (stock >= 0),
@@ -93,6 +106,8 @@ create table if not exists public.delivery_tracking (
 
 create index if not exists products_stock_idx on public.products(stock asc);
 create index if not exists products_category_idx on public.products(category);
+create index if not exists products_category_id_idx on public.products(category_id);
+create index if not exists product_categories_active_name_idx on public.product_categories(is_active desc, name asc);
 create index if not exists orders_retailer_created_idx on public.orders(retailer_id, created_at desc);
 create index if not exists orders_receipt_idx on public.orders(receipt_id);
 create index if not exists orders_status_idx on public.orders(status);
@@ -119,6 +134,11 @@ for each row execute procedure public.set_updated_at();
 drop trigger if exists daily_receipts_updated_at on public.daily_receipts;
 create trigger daily_receipts_updated_at
 before update on public.daily_receipts
+for each row execute procedure public.set_updated_at();
+
+drop trigger if exists product_categories_updated_at on public.product_categories;
+create trigger product_categories_updated_at
+before update on public.product_categories
 for each row execute procedure public.set_updated_at();
 
 drop trigger if exists delivery_tracking_updated_at on public.delivery_tracking;
@@ -166,6 +186,7 @@ as $$
 $$;
 
 alter table public.profiles enable row level security;
+alter table public.product_categories enable row level security;
 alter table public.products enable row level security;
 alter table public.daily_receipts enable row level security;
 alter table public.receipt_items enable row level security;
@@ -186,6 +207,27 @@ drop policy if exists "authenticated product read" on public.products;
 create policy "authenticated product read"
 on public.products for select to authenticated
 using (true);
+
+drop policy if exists "authenticated product category read" on public.product_categories;
+create policy "authenticated product category read"
+on public.product_categories for select to authenticated
+using (true);
+
+drop policy if exists "owner product category insert" on public.product_categories;
+create policy "owner product category insert"
+on public.product_categories for insert to authenticated
+with check (public.get_my_role() = 'OWNER');
+
+drop policy if exists "owner product category update" on public.product_categories;
+create policy "owner product category update"
+on public.product_categories for update to authenticated
+using (public.get_my_role() = 'OWNER')
+with check (public.get_my_role() = 'OWNER');
+
+drop policy if exists "owner product category delete" on public.product_categories;
+create policy "owner product category delete"
+on public.product_categories for delete to authenticated
+using (public.get_my_role() = 'OWNER');
 
 drop policy if exists "daily receipt visibility by role" on public.daily_receipts;
 create policy "daily receipt visibility by role"

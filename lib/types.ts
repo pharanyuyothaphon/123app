@@ -6,16 +6,26 @@ export type OrderStatus =
   | "DELIVERING"
   | "COMPLETED";
 
-export type DashboardView = "overview" | "orders" | "add-product" | "tracking" | "cart";
+export type DashboardView = "overview" | "orders" | "add-product" | "categories" | "tracking" | "cart";
 
 export interface Product {
   id: string;
   name: string;
   category?: string;
+  category_id?: string | null;
   price_box: number;
   price_pack: number | null;
   stock: number;
   created_at?: string;
+}
+
+export interface ProductCategory {
+  id: string;
+  name: string;
+  normalized_name: string;
+  is_active: boolean;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface Retailer {
@@ -99,6 +109,7 @@ export interface AppSession {
 
 export interface DashboardSnapshot {
   products: Product[];
+  categories: ProductCategory[];
   orders: Order[];
   receipts: DailyReceipt[];
   retailers: Retailer[];

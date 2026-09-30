@@ -1,7 +1,8 @@
 -- 123พาณิชย์ปลีกส่ง · ส่วนเพิ่มสำหรับ Custom Auth
 -- รันใน Supabase Dashboard > SQL Editor เพียงครั้งเดียว
 -- หลังจากไฟล์นี้ ให้รัน migrations/20260906_daily_receipts_categories_checkout_stock.sql
--- ก่อนเปิดใช้งานแอป เพื่อใช้ใบเสร็จรายวันและ RPC การสั่งซื้อเวอร์ชันปัจจุบัน
+-- และ migrations/20260930_product_category_management.sql ก่อนเปิดใช้งานแอป
+-- เพื่อใช้ใบเสร็จรายวัน, RPC การสั่งซื้อ และระบบจัดการประเภทสินค้ารุ่นปัจจุบัน
 -- SQL นี้เก็บตาราง, ข้อมูล, RLS policy, trigger และ RPC เดิมไว้ทั้งหมด
 -- เพิ่มเพียง app_credentials, auth_version และ Custom RPC ที่ชื่อขึ้นต้นด้วย custom_
 

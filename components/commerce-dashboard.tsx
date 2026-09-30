@@ -7,12 +7,15 @@ import { roleDashboardPath } from "@/lib/role-routes";
 import {
   addProduct,
   adjustStock,
+  createProductCategory,
   createRetailerOrder,
+  deleteProductCategory,
   deleteProduct,
   fetchDashboardSnapshot,
   getProfile,
   saveDeliveryTracking,
   signOut,
+  updateProductCategory,
   updateDeliveryStatus,
 } from "@/lib/supabase";
 import type {
@@ -25,12 +28,13 @@ import type {
   Order,
   OrderStatus,
   Product,
+  ProductCategory,
   Retailer,
   Role,
 } from "@/lib/types";
 
 type CartState = Record<string, { boxes: number; packs: number }>;
-type ProductDraft = { name: string; category: string; priceBox: string; pricePack: string; stock: string };
+type ProductDraft = { name: string; categoryId: string; priceBox: string; pricePack: string; stock: string };
 type SharedLocation = { orderId: string; latitude: number; longitude: number; sentAt: number };
 
 const LOCATION_MIN_SEND_GAP_MS = 5_000;
@@ -92,6 +96,7 @@ const navByRole: Record<Role, Array<{ view: DashboardView; label: string; glyph:
     { view: "overview", label: "คลังสินค้าทั้งหมด", glyph: "▦" },
     { view: "orders", label: "รายการสินค้าร้านค้า", glyph: "☷" },
     { view: "add-product", label: "เพิ่มสินค้า", glyph: "+" },
+    { view: "categories", label: "ประเภทสินค้า", glyph: "≡" },
     { view: "tracking", label: "ติดตามพนักงาน", glyph: "⌁" },
   ],
   ADMIN: [{ view: "overview", label: "จัดการคลังสินค้า", glyph: "▦" }],
@@ -110,11 +115,12 @@ const viewTitle: Record<DashboardView, { title: string; subtitle: string }> = {
   overview: { title: "ภาพรวมการทำงาน", subtitle: "ข้อมูลล่าสุดที่ต้องจัดการในวันนี้" },
   orders: { title: "รายการสินค้าร้านค้า", subtitle: "รวมรายการที่ผู้ค้าปลีกเลือกไว้ในแต่ละคำสั่งซื้อ" },
   "add-product": { title: "เพิ่มสินค้าเข้าคลัง", subtitle: "กำหนดราคากล่องและราคาแพ็คให้พร้อมสั่งซื้อ" },
+  categories: { title: "จัดการประเภทสินค้า", subtitle: "เพิ่ม แก้ไข และกำหนดประเภทสินค้าที่ใช้งานได้" },
   tracking: { title: "แผนที่การจัดส่ง", subtitle: "ติดตามตำแหน่งพนักงานและสถานะการนำส่ง" },
   cart: { title: "ตะกร้าสินค้าของฉัน", subtitle: "ตรวจสอบรายการและยอดรวมก่อนยืนยันคำสั่งซื้อ" },
 };
 
-const createEmptyDraft = (): ProductDraft => ({ name: "", category: "ทั่วไป", priceBox: "", pricePack: "", stock: "0" });
+const createEmptyDraft = (categoryId = ""): ProductDraft => ({ name: "", categoryId, priceBox: "", pricePack: "", stock: "0" });
 
 function retailerCartStorageKey(retailerId: string) {
   return `${RETAILER_CART_STORAGE_PREFIX}${retailerId}`;
@@ -242,6 +248,7 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
   const [identity, setIdentity] = useState<Retailer | null>(null);
   const [session, setSession] = useState<AppSession | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
+  const [categories, setCategories] = useState<ProductCategory[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [receipts, setReceipts] = useState<DailyReceipt[]>([]);
   const [retailers, setRetailers] = useState<Retailer[]>([]);
@@ -267,6 +274,19 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
 
   const applySnapshot = useCallback((snapshot: DashboardSnapshot) => {
     setProducts([...snapshot.products].sort((a, b) => a.stock - b.stock));
+    const nextCategories = [...snapshot.categories].sort((left, right) => {
+      if (left.is_active !== right.is_active) return left.is_active ? -1 : 1;
+      return left.name.localeCompare(right.name, "th-TH");
+    });
+    setCategories(nextCategories);
+    setDraft((current) => {
+      const selected = nextCategories.find((category) => category.id === current.categoryId && category.is_active);
+      if (selected) return current;
+      const defaultCategory = nextCategories.find((category) => category.is_active && category.normalized_name === "ทั่วไป")
+        || nextCategories.find((category) => category.is_active)
+        || null;
+      return { ...current, categoryId: defaultCategory?.id || "" };
+    });
     setOrders(snapshot.orders);
     setReceipts(snapshot.receipts);
     setRetailers(snapshot.retailers);
@@ -387,13 +407,13 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     const normalized = query.trim().toLocaleLowerCase("th-TH");
     return [...products]
       .filter((product) => product.name.toLocaleLowerCase("th-TH").includes(normalized) || (product.category || "").toLocaleLowerCase("th-TH").includes(normalized))
-      .filter((product) => !categoryFilter || product.category === categoryFilter)
+      .filter((product) => !categoryFilter || product.category_id === categoryFilter)
       .sort((a, b) => a.stock - b.stock);
   }, [categoryFilter, products, query]);
 
   const productCategories = useMemo(
-    () => Array.from(new Set(products.map((product) => product.category || "").filter(Boolean))).sort((left, right) => left.localeCompare(right, "th-TH")),
-    [products],
+    () => categories.filter((category) => category.is_active || products.some((product) => product.category_id === category.id)),
+    [categories, products],
   );
 
   const cartLines = useMemo<CartLine[]>(() => {
@@ -476,12 +496,87 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     }
   };
 
+  const addCategory = async (name: string): Promise<ProductCategory | null> => {
+    if (!session) {
+      notify("เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่");
+      return null;
+    }
+    setBusyAction("create-category");
+    try {
+      const created = await createProductCategory(session, name);
+      setCategories((current) => [...current, created].sort((left, right) => {
+        if (left.is_active !== right.is_active) return left.is_active ? -1 : 1;
+        return left.name.localeCompare(right.name, "th-TH");
+      }));
+      setDraft((current) => ({ ...current, categoryId: created.id }));
+      notify(`เพิ่มประเภทสินค้า “${created.name}” แล้ว`);
+      return created;
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "เพิ่มประเภทสินค้าไม่สำเร็จ");
+      return null;
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const editCategory = async (categoryId: string, input: { name?: string; isActive?: boolean }) => {
+    if (!session) {
+      notify("เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่");
+      return null;
+    }
+    setBusyAction(`category-${categoryId}`);
+    try {
+      const updated = await updateProductCategory(session, categoryId, input);
+      setCategories((current) => current.map((category) => category.id === categoryId ? updated : category).sort((left, right) => {
+        if (left.is_active !== right.is_active) return left.is_active ? -1 : 1;
+        return left.name.localeCompare(right.name, "th-TH");
+      }));
+      if (input.name) {
+        setProducts((current) => current.map((product) => product.category_id === categoryId ? { ...product, category: updated.name } : product));
+      }
+      if (!updated.is_active) {
+        setDraft((current) => {
+          if (current.categoryId !== categoryId) return current;
+          const replacement = categories.find((category) => category.id !== categoryId && category.is_active);
+          return { ...current, categoryId: replacement?.id || "" };
+        });
+      }
+      notify(input.name ? "เปลี่ยนชื่อประเภทสินค้าแล้ว" : updated.is_active ? "เปิดใช้งานประเภทสินค้าแล้ว" : "ปิดใช้งานประเภทสินค้าแล้ว");
+      return updated;
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "บันทึกประเภทสินค้าไม่สำเร็จ");
+      return null;
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const removeCategory = async (category: ProductCategory) => {
+    if (!window.confirm(`ต้องการลบประเภทสินค้า “${category.name}” หรือไม่?`)) return;
+    if (!session) {
+      notify("เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่");
+      return;
+    }
+    setBusyAction(`delete-category-${category.id}`);
+    try {
+      await deleteProductCategory(session, category.id);
+      setCategories((current) => current.filter((item) => item.id !== category.id));
+      setDraft((current) => current.categoryId === category.id ? { ...current, categoryId: "" } : current);
+      notify("ลบประเภทสินค้าแล้ว");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "ลบประเภทสินค้าไม่สำเร็จ");
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const submitProduct = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const priceBox = Number(draft.priceBox);
     const pricePack = draft.pricePack.trim() ? Number(draft.pricePack) : null;
     const stock = Math.max(0, Number(draft.stock || 0));
-    if (!draft.name.trim() || !draft.category.trim() || !Number.isFinite(priceBox) || priceBox < 0 || (pricePack !== null && (!Number.isFinite(pricePack) || pricePack < 0))) {
+    const category = categories.find((item) => item.id === draft.categoryId && item.is_active) || null;
+    if (!draft.name.trim() || !category || !Number.isFinite(priceBox) || priceBox < 0 || (pricePack !== null && (!Number.isFinite(pricePack) || pricePack < 0))) {
       notify("กรุณาระบุชื่อสินค้า ประเภทสินค้า และราคากล่องให้ถูกต้อง");
       return;
     }
@@ -489,7 +584,8 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     const optimistic: Product = {
       id: `local-${Date.now()}`,
       name: draft.name.trim(),
-      category: draft.category.trim(),
+      category: category.name,
+      category_id: category.id,
       price_box: priceBox,
       price_pack: pricePack,
       stock,
@@ -503,13 +599,13 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
     try {
       const created = await addProduct(session, {
         name: optimistic.name,
-        category: optimistic.category,
+        categoryId: category.id,
         price_box: optimistic.price_box,
         price_pack: optimistic.price_pack,
         stock: optimistic.stock,
       });
       setProducts((current) => [...current, created || optimistic].sort((a, b) => a.stock - b.stock));
-      setDraft(createEmptyDraft());
+      setDraft(createEmptyDraft(category.id));
       notify("เพิ่มสินค้าเข้าคลังเรียบร้อยแล้ว");
       setActiveView("overview");
     } catch (error) {
@@ -759,7 +855,10 @@ export function CommerceDashboard({ expectedRole }: { expectedRole: Role }) {
       );
     }
     if (activeView === "add-product") {
-      return <ProductForm draft={draft} onChange={setDraft} onSubmit={submitProduct} pending={busyAction === "add-product"} />;
+      return <ProductForm draft={draft} categories={categories} onChange={setDraft} onSubmit={submitProduct} onCreateCategory={addCategory} onManageCategories={() => setActiveView("categories")} pending={busyAction === "add-product"} categoryPending={busyAction === "create-category"} />;
+    }
+    if (activeView === "categories") {
+      return <CategoryManager categories={categories} products={products} busyAction={busyAction} onCreate={addCategory} onUpdate={editCategory} onDelete={removeCategory} onAddProduct={() => setActiveView("add-product")} />;
     }
     if (activeView === "tracking") {
       return <TrackingWorkspace orders={orders} title="สถานะการส่งของพนักงาน" caption="ตำแหน่งล่าสุดที่พนักงานแชร์ให้เจ้าของร้านและผู้ค้าปลีก" />;
@@ -1012,8 +1111,8 @@ function MetricRow({ metrics }: { metrics: Array<{ label: string; value: string;
   return <section className={`grid gap-3 ${metrics.length > 3 ? "sm:grid-cols-2 xl:grid-cols-4" : "sm:grid-cols-3"}`}>{metrics.map((metric) => <article key={metric.label} className="rounded-[22px] border border-[#dbe8e2] bg-white p-4 shadow-sm sm:p-5"><div className="flex items-start justify-between"><span className={`grid h-10 w-10 place-items-center rounded-xl text-lg font-black ${metric.tone}`}>{metric.glyph}</span><span className="text-3xl font-black tracking-[-.05em] text-[#173f35]">{metric.value}</span></div><p className="mt-4 text-sm font-black text-[#345b50]">{metric.label}</p><p className="mt-1 text-[11px] font-semibold text-[#778e84]">{metric.note}</p></article>)}</section>;
 }
 
-function SearchInput({ query, onChange, categories, category, onCategoryChange }: { query: string; onChange: (value: string) => void; categories?: string[]; category?: string; onCategoryChange?: (value: string) => void }) {
-  return <div className="flex flex-wrap items-center gap-2"><label className="flex min-w-[210px] flex-1 items-center gap-2 rounded-xl border border-[#d6e5de] bg-[#fbfcfa] px-3 py-2.5 text-[#688075] transition focus-within:border-[#1c8068] focus-within:ring-4 focus-within:ring-[#d8eee5]"><span className="text-base">⌕</span><input value={query} onChange={(event) => onChange(event.target.value)} placeholder="ค้นหาสินค้า" className="min-w-0 flex-1 bg-transparent text-xs font-bold text-[#32544a] outline-none placeholder:text-[#9cafaa]" /></label>{onCategoryChange && <label className="flex items-center gap-2 rounded-xl border border-[#d6e5de] bg-[#fbfcfa] px-3 py-2.5 text-xs font-bold text-[#45665b] focus-within:border-[#1c8068] focus-within:ring-4 focus-within:ring-[#d8eee5]"><span className="text-[#698177]">ประเภท</span><select aria-label="กรองตามประเภทสินค้า" value={category || ""} onChange={(event) => onCategoryChange(event.target.value)} className="max-w-[150px] bg-transparent text-xs font-extrabold text-[#254b40] outline-none"><option value="">ทุกประเภท</option>{(categories || []).map((item) => <option key={item} value={item}>{item}</option>)}</select></label>}</div>;
+function SearchInput({ query, onChange, categories, category, onCategoryChange }: { query: string; onChange: (value: string) => void; categories?: ProductCategory[]; category?: string; onCategoryChange?: (value: string) => void }) {
+  return <div className="flex flex-wrap items-center gap-2"><label className="flex min-w-[210px] flex-1 items-center gap-2 rounded-xl border border-[#d6e5de] bg-[#fbfcfa] px-3 py-2.5 text-[#688075] transition focus-within:border-[#1c8068] focus-within:ring-4 focus-within:ring-[#d8eee5]"><span className="text-base">⌕</span><input value={query} onChange={(event) => onChange(event.target.value)} placeholder="ค้นหาสินค้า" className="min-w-0 flex-1 bg-transparent text-xs font-bold text-[#32544a] outline-none placeholder:text-[#9cafaa]" /></label>{onCategoryChange && <label className="flex items-center gap-2 rounded-xl border border-[#d6e5de] bg-[#fbfcfa] px-3 py-2.5 text-xs font-bold text-[#45665b] focus-within:border-[#1c8068] focus-within:ring-4 focus-within:ring-[#d8eee5]"><span className="text-[#698177]">ประเภท</span><select aria-label="กรองตามประเภทสินค้า" value={category || ""} onChange={(event) => onCategoryChange(event.target.value)} className="max-w-[150px] bg-transparent text-xs font-extrabold text-[#254b40] outline-none"><option value="">ทุกประเภท</option>{(categories || []).map((item) => <option key={item.id} value={item.id}>{item.name}{item.is_active ? "" : " (ปิดใช้งาน)"}</option>)}</select></label>}</div>;
 }
 
 function ProductMark({ product, size = "md" }: { product: Product; size?: "sm" | "md" }) {
@@ -1067,9 +1166,185 @@ function ReceiptDetail({ receipt }: { receipt: DailyReceipt | null }) {
   return <section className="rounded-[25px] border border-[#dbe8e2] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#edf2ef] pb-5"><div><p className="text-[11px] font-black tracking-[.11em] text-[#6d887e]">DAILY RECEIPT</p><h2 className="mt-1 text-xl font-black tracking-tight text-[#173f35]">{receipt.retailer?.shop_name || "ร้านค้าที่ลงทะเบียน"}</h2><p className="mt-1 text-xs font-medium text-[#7c9289]">วันที่สั่งซื้อ {receiptDate(receipt.receipt_date)} · ใบเสร็จ {receipt.id.slice(-8).toUpperCase()}</p></div><span className="rounded-xl bg-[#e5f3ed] px-3 py-2 text-xs font-black text-[#177253]">บันทึกแล้ว</span></div><div className="mt-3 divide-y divide-[#edf2ef]">{receipt.items.map((item, index) => { const product = item.product || { id: item.product_id || `receipt-${index}`, name: item.product_name, category: item.category || "ทั่วไป", price_box: item.unit_price_box, price_pack: item.unit_price_pack, stock: 0 }; return <div key={item.id || `${item.product_id || item.product_name}-${index}`} className="flex items-center gap-3 py-3"><ProductMark product={product} size="sm" /><div className="min-w-0 flex-1"><p className="truncate text-sm font-black text-[#305449]">{item.product?.name || item.product_name}</p><div className="mt-0.5 flex flex-wrap items-center gap-1.5"><span className="rounded-md bg-[#edf5f1] px-1.5 py-0.5 text-[10px] font-black text-[#316756]">{item.product?.category || item.category || "ทั่วไป"}</span><span className="text-[11px] font-semibold text-[#7a9087]">{item.quantity_box > 0 && `${item.quantity_box} กล่อง`}{item.quantity_box > 0 && item.quantity_pack > 0 && " · "}{item.quantity_pack > 0 && `${item.quantity_pack} แพ็ค`}</span></div></div><span className="text-sm font-black text-[#174d40]">{price(item.line_total)}</span></div>; })}</div><div className="mt-4 flex items-end justify-between rounded-2xl bg-[#f2f7f4] p-4"><div><p className="text-xs font-bold text-[#688078]">ยอดรวมในใบเสร็จ</p><p className="mt-1 text-[11px] text-[#81968d]">{receipt.items.length} รายการสินค้า · วันที่สั่งซื้อ {receiptDate(receipt.receipt_date)}</p></div><p className="text-2xl font-black tracking-tight text-[#0e594b]">{price(receipt.total_amount)}</p></div></section>;
 }
 
-function ProductForm({ draft, onChange, onSubmit, pending }: { draft: ProductDraft; onChange: (value: ProductDraft) => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void; pending: boolean }) {
+function ProductForm({
+  draft,
+  categories,
+  onChange,
+  onSubmit,
+  onCreateCategory,
+  onManageCategories,
+  pending,
+  categoryPending,
+}: {
+  draft: ProductDraft;
+  categories: ProductCategory[];
+  onChange: (value: ProductDraft) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onCreateCategory: (name: string) => Promise<ProductCategory | null>;
+  onManageCategories: () => void;
+  pending: boolean;
+  categoryPending: boolean;
+}) {
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [showNewCategory, setShowNewCategory] = useState(false);
+  const activeCategories = categories.filter((category) => category.is_active);
   const update = (key: keyof ProductDraft, value: string) => onChange({ ...draft, [key]: value });
-  return <section className="mx-auto max-w-3xl rounded-[27px] border border-[#dbe8e2] bg-white p-5 shadow-sm sm:p-7"><div className="flex items-start gap-4 border-b border-[#edf2ef] pb-5"><span className="grid h-11 w-11 place-items-center rounded-2xl bg-[#fff0e9] text-2xl font-black text-[#c45c37]">+</span><div><h2 className="text-xl font-black tracking-tight text-[#173f35]">เพิ่มสินค้าใหม่</h2><p className="mt-1 text-sm leading-6 text-[#72877f]">ระบุประเภทสินค้าเพื่อให้ผู้ค้าปลีกค้นหาและกรองสินค้าได้สะดวก</p></div></div><form onSubmit={onSubmit} className="mt-6 grid gap-4 sm:grid-cols-2"><Field label="ชื่อสินค้า" required><input value={draft.name} onChange={(event) => update("name", event.target.value)} placeholder="เช่น น้ำยาล้างจาน 500 มล." className={inputClass} required /></Field><Field label="ประเภทสินค้า" required><input value={draft.category} onChange={(event) => update("category", event.target.value)} list="product-category-options" maxLength={80} placeholder="เช่น ของใช้ในบ้าน" className={inputClass} required /><datalist id="product-category-options"><option value="ทั่วไป" /><option value="อาหารและเครื่องดื่ม" /><option value="ของใช้ในบ้าน" /><option value="ของใช้ส่วนตัว" /><option value="อุปกรณ์สำนักงาน" /></datalist></Field><Field label="ราคากล่อง (บาท)" required><input value={draft.priceBox} onChange={(event) => update("priceBox", event.target.value)} type="number" min="0" step="0.01" placeholder="0.00" className={inputClass} required /></Field><Field label="ราคาแพ็ค (บาท)" hint="ไม่บังคับ"><input value={draft.pricePack} onChange={(event) => update("pricePack", event.target.value)} type="number" min="0" step="0.01" placeholder="เว้นว่างได้" className={inputClass} /></Field><Field label="จำนวนเริ่มต้นในคลัง"><input value={draft.stock} onChange={(event) => update("stock", event.target.value)} type="number" min="0" step="1" placeholder="0" className={inputClass} /></Field><div className="hidden sm:block" /><div className="sm:col-span-2 flex flex-col-reverse gap-3 border-t border-[#edf2ef] pt-5 sm:flex-row sm:justify-end"><button type="button" onClick={() => onChange(createEmptyDraft())} className="rounded-xl px-4 py-3 text-sm font-extrabold text-[#658077] transition hover:bg-[#f3f7f5]">ล้างข้อมูล</button><button disabled={pending} type="submit" className="rounded-xl bg-[#f27d52] px-5 py-3 text-sm font-extrabold text-white shadow-[0_10px_20px_rgba(242,125,82,.22)] transition hover:bg-[#e86d43] disabled:opacity-60">{pending ? "กำลังบันทึก..." : "บันทึกสินค้าเข้าคลัง"} →</button></div></form></section>;
+
+  const addInlineCategory = async () => {
+    const created = await onCreateCategory(newCategoryName);
+    if (!created) return;
+    setNewCategoryName("");
+    setShowNewCategory(false);
+    onChange({ ...draft, categoryId: created.id });
+  };
+
+  return (
+    <section className="mx-auto max-w-3xl rounded-[27px] border border-[#dbe8e2] bg-white p-5 shadow-sm sm:p-7">
+      <div className="flex items-start justify-between gap-4 border-b border-[#edf2ef] pb-5">
+        <div className="flex items-start gap-4">
+          <span className="grid h-11 w-11 place-items-center rounded-2xl bg-[#fff0e9] text-2xl font-black text-[#c45c37]">+</span>
+          <div>
+            <h2 className="text-xl font-black tracking-tight text-[#173f35]">เพิ่มสินค้าใหม่</h2>
+            <p className="mt-1 text-sm leading-6 text-[#72877f]">เลือกประเภทที่จัดการไว้ เพื่อให้ผู้ค้าปลีกกรองสินค้าได้ถูกต้อง</p>
+          </div>
+        </div>
+        <button type="button" onClick={onManageCategories} className="shrink-0 rounded-xl border border-[#cde1d8] px-3 py-2 text-xs font-extrabold text-[#236550] transition hover:bg-[#edf6f1]">จัดการประเภท</button>
+      </div>
+      <form onSubmit={onSubmit} className="mt-6 grid gap-4 sm:grid-cols-2">
+        <Field label="ชื่อสินค้า" required>
+          <input value={draft.name} onChange={(event) => update("name", event.target.value)} placeholder="เช่น น้ำยาล้างจาน 500 มล." className={inputClass} required />
+        </Field>
+        <Field label="ประเภทสินค้า" required>
+          <select value={draft.categoryId} onChange={(event) => update("categoryId", event.target.value)} className={inputClass} required disabled={!activeCategories.length}>
+            <option value="">{activeCategories.length ? "เลือกประเภทสินค้า" : "ยังไม่มีประเภทสินค้า"}</option>
+            {activeCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
+          </select>
+          <div className="mt-2">
+            {showNewCategory ? (
+              <div className="flex gap-2">
+                <input value={newCategoryName} onChange={(event) => setNewCategoryName(event.target.value)} maxLength={80} placeholder="ชื่อประเภทใหม่" className={inputClass + " min-w-0 py-2"} aria-label="ชื่อประเภทสินค้าใหม่" />
+                <button type="button" disabled={!newCategoryName.trim() || categoryPending} onClick={() => void addInlineCategory()} className="shrink-0 rounded-xl bg-[#0e4d43] px-3 text-xs font-extrabold text-white disabled:opacity-50">{categoryPending ? "กำลังเพิ่ม..." : "เพิ่ม"}</button>
+                <button type="button" onClick={() => { setShowNewCategory(false); setNewCategoryName(""); }} className="shrink-0 rounded-xl px-2 text-xs font-extrabold text-[#6b847a]">ยกเลิก</button>
+              </div>
+            ) : (
+              <button type="button" onClick={() => setShowNewCategory(true)} className="text-xs font-extrabold text-[#14745d] underline-offset-2 hover:underline">+ เพิ่มประเภทใหม่</button>
+            )}
+          </div>
+        </Field>
+        <Field label="ราคากล่อง (บาท)" required>
+          <input value={draft.priceBox} onChange={(event) => update("priceBox", event.target.value)} type="number" min="0" step="0.01" placeholder="0.00" className={inputClass} required />
+        </Field>
+        <Field label="ราคาแพ็ค (บาท)" hint="ไม่บังคับ">
+          <input value={draft.pricePack} onChange={(event) => update("pricePack", event.target.value)} type="number" min="0" step="0.01" placeholder="เว้นว่างได้" className={inputClass} />
+        </Field>
+        <Field label="จำนวนเริ่มต้นในคลัง">
+          <input value={draft.stock} onChange={(event) => update("stock", event.target.value)} type="number" min="0" step="1" placeholder="0" className={inputClass} />
+        </Field>
+        <div className="hidden sm:block" />
+        <div className="sm:col-span-2 flex flex-col-reverse gap-3 border-t border-[#edf2ef] pt-5 sm:flex-row sm:justify-end">
+          <button type="button" onClick={() => onChange(createEmptyDraft(draft.categoryId))} className="rounded-xl px-4 py-3 text-sm font-extrabold text-[#658077] transition hover:bg-[#f3f7f5]">ล้างข้อมูล</button>
+          <button disabled={pending || !activeCategories.length} type="submit" className="rounded-xl bg-[#f27d52] px-5 py-3 text-sm font-extrabold text-white shadow-[0_10px_20px_rgba(242,125,82,.22)] transition hover:bg-[#e86d43] disabled:opacity-60">{pending ? "กำลังบันทึก..." : "บันทึกสินค้าเข้าคลัง"} →</button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function CategoryManager({
+  categories,
+  products,
+  busyAction,
+  onCreate,
+  onUpdate,
+  onDelete,
+  onAddProduct,
+}: {
+  categories: ProductCategory[];
+  products: Product[];
+  busyAction: string | null;
+  onCreate: (name: string) => Promise<ProductCategory | null>;
+  onUpdate: (categoryId: string, input: { name?: string; isActive?: boolean }) => Promise<ProductCategory | null>;
+  onDelete: (category: ProductCategory) => Promise<void>;
+  onAddProduct: () => void;
+}) {
+  const [newName, setNewName] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
+
+  const addCategory = async () => {
+    const created = await onCreate(newName);
+    if (created) setNewName("");
+  };
+
+  const saveName = async (category: ProductCategory) => {
+    const updated = await onUpdate(category.id, { name: editingName });
+    if (updated) {
+      setEditingId(null);
+      setEditingName("");
+    }
+  };
+
+  return (
+    <section className="mx-auto max-w-4xl rounded-[27px] border border-[#dbe8e2] bg-white p-5 shadow-sm sm:p-7">
+      <div className="flex flex-col justify-between gap-4 border-b border-[#edf2ef] pb-5 sm:flex-row sm:items-start">
+        <div className="flex items-start gap-4">
+          <span className="grid h-11 w-11 place-items-center rounded-2xl bg-[#e5f3ed] text-xl font-black text-[#0e715c]">≡</span>
+          <div>
+            <h2 className="text-xl font-black tracking-tight text-[#173f35]">ประเภทสินค้า</h2>
+            <p className="mt-1 text-sm leading-6 text-[#72877f]">เพิ่มชื่อประเภทครั้งเดียว แล้วเลือกใช้ซ้ำได้ในสินค้าและตัวกรองผู้ค้าปลีก</p>
+          </div>
+        </div>
+        <button type="button" onClick={onAddProduct} className="rounded-xl bg-[#0e4d43] px-4 py-2.5 text-xs font-extrabold text-white transition hover:bg-[#0a4038]">+ เพิ่มสินค้า</button>
+      </div>
+
+      <div className="mt-5 rounded-2xl bg-[#f2f7f4] p-4">
+        <p className="text-xs font-black text-[#345f52]">เพิ่มประเภทสินค้าใหม่</p>
+        <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+          <input value={newName} onChange={(event) => setNewName(event.target.value)} maxLength={80} placeholder="เช่น เครื่องดื่ม, ขนม, อุปกรณ์สำนักงาน" className={inputClass} aria-label="ชื่อประเภทสินค้าใหม่" />
+          <button type="button" disabled={!newName.trim() || busyAction === "create-category"} onClick={() => void addCategory()} className="rounded-xl bg-[#f27d52] px-4 py-3 text-sm font-extrabold text-white transition hover:bg-[#e86d43] disabled:opacity-50">{busyAction === "create-category" ? "กำลังเพิ่ม..." : "เพิ่มประเภท"}</button>
+        </div>
+      </div>
+
+      <div className="mt-5 divide-y divide-[#edf2ef]">
+        {categories.map((category) => {
+          const productCount = products.filter((product) => product.category_id === category.id).length;
+          const isEditing = editingId === category.id;
+          const isGeneral = category.normalized_name === "ทั่วไป";
+          const busy = busyAction === "category-" + category.id || busyAction === "delete-category-" + category.id;
+
+          return (
+            <div key={category.id} className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center">
+              <span className={"grid h-10 w-10 shrink-0 place-items-center rounded-xl text-sm font-black " + (category.is_active ? "bg-[#e5f3ed] text-[#0e715c]" : "bg-[#f1f3f2] text-[#81928c]")}>{category.name.slice(0, 1)}</span>
+              <div className="min-w-0 flex-1">
+                {isEditing ? (
+                  <div className="flex max-w-md gap-2">
+                    <input value={editingName} onChange={(event) => setEditingName(event.target.value)} maxLength={80} className={inputClass + " py-2"} aria-label={"แก้ไขชื่อประเภท " + category.name} />
+                    <button type="button" disabled={!editingName.trim() || busy} onClick={() => void saveName(category)} className="rounded-xl bg-[#0e4d43] px-3 text-xs font-extrabold text-white disabled:opacity-50">บันทึก</button>
+                    <button type="button" onClick={() => { setEditingId(null); setEditingName(""); }} className="px-2 text-xs font-extrabold text-[#698077]">ยกเลิก</button>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-sm font-black text-[#264b41]">{category.name}</p>
+                    <span className={"rounded-md px-2 py-1 text-[10px] font-black " + (category.is_active ? "bg-[#e5f3ed] text-[#207653]" : "bg-[#f1f3f2] text-[#718179]")}>{category.is_active ? "ใช้งานอยู่" : "ปิดใช้งาน"}</span>
+                    {isGeneral && <span className="rounded-md bg-[#fff5da] px-2 py-1 text-[10px] font-black text-[#8a6814]">ประเภทเริ่มต้น</span>}
+                  </div>
+                )}
+                <p className="mt-1 text-xs text-[#748a80]">ใช้กับสินค้า {productCount} รายการ{!category.is_active && " · สินค้าเดิมยังแสดงอยู่ แต่เพิ่มสินค้าใหม่ไม่ได้"}</p>
+              </div>
+              {!isEditing && (
+                <div className="flex flex-wrap gap-2">
+                  {!isGeneral && <button type="button" disabled={busy} onClick={() => { setEditingId(category.id); setEditingName(category.name); }} className="rounded-xl border border-[#d5e5dd] px-3 py-2 text-xs font-extrabold text-[#315f52] transition hover:bg-[#f2f7f4] disabled:opacity-50">เปลี่ยนชื่อ</button>}
+                  {!isGeneral && <button type="button" disabled={busy} onClick={() => void onUpdate(category.id, { isActive: !category.is_active })} className="rounded-xl border border-[#d5e5dd] px-3 py-2 text-xs font-extrabold text-[#315f52] transition hover:bg-[#f2f7f4] disabled:opacity-50">{category.is_active ? "ปิดใช้งาน" : "เปิดใช้งาน"}</button>}
+                  {!isGeneral && productCount === 0 && <button type="button" disabled={busy} onClick={() => void onDelete(category)} className="rounded-xl border border-[#f2c7b7] px-3 py-2 text-xs font-extrabold text-[#b65335] transition hover:bg-[#fff3ee] disabled:opacity-50">ลบ</button>}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {!categories.length && <EmptyState icon="≡" title="ยังไม่มีประเภทสินค้า" text="เพิ่มประเภทแรกเพื่อเริ่มบันทึกสินค้าเข้าคลัง" />}
+    </section>
+  );
 }
 
 const inputClass = "w-full rounded-xl border border-[#d4e3dc] bg-[#fbfcfa] px-3.5 py-3 text-sm font-semibold text-[#264c41] outline-none transition placeholder:text-[#a9bbb4] focus:border-[#1f8168] focus:ring-4 focus:ring-[#d8eee5]";

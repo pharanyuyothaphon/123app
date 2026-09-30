@@ -4,6 +4,7 @@ import type {
   DeliveryTracking,
   Order,
   Product,
+  ProductCategory,
   Retailer,
   Role,
 } from "@/lib/types";
@@ -79,11 +80,37 @@ export async function fetchDashboardSnapshot(
 
 export async function addProduct(
   _session: AppSession,
-  product: Pick<Product, "name" | "category" | "price_box" | "price_pack" | "stock">,
+  product: Pick<Product, "name" | "price_box" | "price_pack" | "stock"> & { categoryId: string },
 ) {
   return apiRequest<Product>("/api/products", {
     method: "POST",
     body: JSON.stringify(product),
+  });
+}
+
+export async function createProductCategory(_session: AppSession, name: string) {
+  const payload = await apiRequest<{ category: ProductCategory }>("/api/categories", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+  return payload.category;
+}
+
+export async function updateProductCategory(
+  _session: AppSession,
+  categoryId: string,
+  input: { name?: string; isActive?: boolean },
+) {
+  const payload = await apiRequest<{ category: ProductCategory }>("/api/categories", {
+    method: "PATCH",
+    body: JSON.stringify({ id: categoryId, ...input }),
+  });
+  return payload.category;
+}
+
+export async function deleteProductCategory(_session: AppSession, categoryId: string) {
+  await apiRequest<{ ok: true }>(`/api/categories?id=${encodeURIComponent(categoryId)}`, {
+    method: "DELETE",
   });
 }
 

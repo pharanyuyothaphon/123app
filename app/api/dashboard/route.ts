@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerAuth } from "@/lib/server-auth";
 import { adminRequest } from "@/lib/server-db";
-import type { DailyReceipt, DashboardSnapshot, DeliveryTracking, Order, Product, Retailer } from "@/lib/types";
+import type { DailyReceipt, DashboardSnapshot, DeliveryTracking, Order, Product, ProductCategory, Retailer } from "@/lib/types";
 
 type RawOrder = Omit<Order, "retailer" | "items" | "tracking"> & {
   retailer?: Retailer | Retailer[] | null;
@@ -45,7 +45,8 @@ export async function GET() {
   }
 
   try {
-    const productQuery = "/rest/v1/products?select=id,name,category,price_box,price_pack,stock,created_at&order=stock.asc";
+    const productQuery = "/rest/v1/products?select=id,name,category,category_id,price_box,price_pack,stock,created_at&order=stock.asc";
+    const categoryQuery = "/rest/v1/product_categories?select=id,name,normalized_name,is_active,created_at,updated_at&order=is_active.desc,name.asc";
     const orderQuery =
       "/rest/v1/orders?select=id,retailer_id,receipt_id,assigned_employee_id,status,total_amount,created_at," +
       "retailer:profiles!orders_retailer_id_fkey(id,shop_name,phone,role)," +
@@ -70,8 +71,9 @@ export async function GET() {
       ? `${receiptQuery}&retailer_id=eq.${encodeURIComponent(auth.user.id)}`
       : receiptQuery;
 
-    const [products, rawOrders, rawReceipts, rawTracking, retailers] = await Promise.all([
+    const [products, categories, rawOrders, rawReceipts, rawTracking, retailers] = await Promise.all([
       adminRequest<Product[]>(productQuery),
+      adminRequest<ProductCategory[]>(categoryQuery),
       canViewOrders ? adminRequest<RawOrder[]>(filteredOrderQuery) : Promise.resolve([] as RawOrder[]),
       canViewReceipts ? adminRequest<RawReceipt[]>(filteredReceiptQuery) : Promise.resolve([] as RawReceipt[]),
       canViewOrders ? adminRequest<RawTracking[]>(trackingQuery) : Promise.resolve([] as RawTracking[]),
@@ -84,6 +86,7 @@ export async function GET() {
       .map((item) => ({ ...item, employee: one(item.employee) }));
     const snapshot: DashboardSnapshot = {
       products: [...products].sort((left, right) => left.stock - right.stock),
+      categories,
       orders: normalizeOrders(rawOrders, tracking),
       receipts: normalizeReceipts(rawReceipts),
       retailers,
